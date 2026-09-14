@@ -23,12 +23,18 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from actions.screen_processor import _capture_screen, _vision_query
+from core.adaptive_poll import AdaptiveInterval
 from core.causal_reasoning import record_event as _record_causal_event
 
 _DEFAULT_INTERVAL_S = 30
 _MIN_INTERVAL_S = 5
 _MAX_INTERVAL_S = 600
 _MAX_DURATION_MIN = 240  # 4 hours — a safety ceiling, not a suggested value
+
+# Consecutive quiet ticks (watch_for not observed) before the poll interval
+# doubles. A hit resets straight back to the user's configured interval —
+# see AdaptiveInterval.
+_BACKOFF_PATIENCE = 3
 
 _lock = threading.Lock()
 _stop_event: Optional[threading.Event] = None
@@ -46,10 +52,18 @@ def _slug(text: str) -> str:
 
 def _run_loop(watch_for: str, interval_s: int, deadline: Optional[datetime],
               stop_event: threading.Event, speak) -> None:
+    # Backs off up to the global interval ceiling regardless of the user's
+    # configured interval_s, so a slow-starting watch (interval_s=5) can
+    # still relax all the way to _MAX_INTERVAL_S during a long quiet spell.
+    backoff = AdaptiveInterval(base=interval_s, max_interval=_MAX_INTERVAL_S,
+                                patience=_BACKOFF_PATIENCE)
+    _state["poll_interval_seconds"] = backoff.current
+
     while not stop_event.is_set():
         if deadline and datetime.now() >= deadline:
             print("[ScreenMonitor] ⏰ Duration elapsed — stopping.")
             break
+        changed = False
         try:
             img_bytes, mime_type = _capture_screen()
             prompt = (
@@ -63,6 +77,7 @@ def _run_loop(watch_for: str, interval_s: int, deadline: Optional[datetime],
             _state["checks"] = _state.get("checks", 0) + 1
 
             if reply.strip().upper().startswith("YES"):
+                changed = True
                 detail = reply.split(None, 1)[1].strip() if " " in reply else ""
                 alert = f"[SCREEN_MONITOR_ALERT] {watch_for}" + (f" — {detail}" if detail else "")
                 _state["alerts"] = _state.get("alerts", 0) + 1
@@ -80,7 +95,9 @@ def _run_loop(watch_for: str, interval_s: int, deadline: Optional[datetime],
         except Exception as e:
             print(f"[ScreenMonitor] ⚠️ Check failed: {e}")
 
-        stop_event.wait(interval_s)
+        next_interval = backoff.report(changed)
+        _state["poll_interval_seconds"] = next_interval
+        stop_event.wait(next_interval)
 
     _state["running"] = False
     print("[ScreenMonitor] 🛑 Stopped.")
@@ -143,8 +160,14 @@ def _status() -> str:
         if not _state.get("running"):
             return "No screen watch is currently running."
         s = dict(_state)
+    current = s.get("poll_interval_seconds", s.get("interval_seconds"))
+    rate_txt = (
+        f"currently every {current}s (backed off from {s.get('interval_seconds')}s)"
+        if current != s.get("interval_seconds")
+        else f"every {current}s"
+    )
     return (
-        f"Watching for '{s.get('watch_for')}' every {s.get('interval_seconds')}s "
+        f"Watching for '{s.get('watch_for')}' {rate_txt} "
         f"since {s.get('started')}. Checks so far: {s.get('checks', 0)}, "
         f"alerts: {s.get('alerts', 0)}."
         + (f" Ends at {s['deadline']}." if s.get("deadline") else " Runs until stopped.")

@@ -16,6 +16,14 @@ from typing import Callable, Optional
 import numpy as np
 import sounddevice as sd
 
+from core.sentiment_adapter import SpeechProfile
+
+_NEUTRAL_PROFILE = SpeechProfile(rate_percent=0, pitch_hz=0, speed_multiplier=1.0, stability=0.5)
+
+
+def _fmt_signed(value: float, suffix: str) -> str:
+    return f"{value:+.0f}{suffix}"
+
 
 
 # USE_TF=0 stops transformers from importing TensorFlow (saves 4-8 s startup).
@@ -108,18 +116,22 @@ class EdgeTTSEngine:
     def __init__(self, voice: str = "en-US-GuyNeural"):
         self.voice = voice
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, profile: Optional[SpeechProfile] = None) -> None:
         loop = asyncio.new_event_loop()
         try:
-            audio_bytes = loop.run_until_complete(self._synth(text))
+            audio_bytes = loop.run_until_complete(self._synth(text, profile or _NEUTRAL_PROFILE))
         finally:
             loop.close()
         if audio_bytes:
             _play_audio_bytes(audio_bytes)
 
-    async def _synth(self, text: str) -> bytes:
+    async def _synth(self, text: str, profile: SpeechProfile) -> bytes:
         import edge_tts
-        comm = edge_tts.Communicate(text, self.voice)
+        comm = edge_tts.Communicate(
+            text, self.voice,
+            rate=_fmt_signed(profile.rate_percent, "%"),
+            pitch=_fmt_signed(profile.pitch_hz, "Hz"),
+        )
         buf  = bytearray()
         async for chunk in comm.stream():
             if chunk["type"] == "audio":
@@ -307,10 +319,15 @@ class KokoroTTSEngine:
         except Exception as e:
             print(f"[TTS] Kokoro warmup warning: {e}")
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, profile: Optional[SpeechProfile] = None) -> None:
         with self._lock:
             if self._pipeline is None:
                 self._init()
+
+        # Sentiment-driven speed multiplier applied on top of the user's own
+        # configured speed, not in place of it — a frustrated+urgent tick
+        # should speak faster than whatever baseline the user already picked.
+        effective_speed = self.speed * (profile.speed_multiplier if profile else 1.0)
 
         # ── Concurrent synthesise + playback ────────────────────────────────
         # Kokoro generates audio chunks lazily.  Without threading, we:
@@ -323,7 +340,7 @@ class KokoroTTSEngine:
 
         def _synth():
             try:
-                for _, _, audio in self._pipeline(text, voice=self.voice, speed=self.speed):
+                for _, _, audio in self._pipeline(text, voice=self.voice, speed=effective_speed):
                     if audio is not None:
                         arr = _to_numpy(audio)
                         arr = _compress_silence(arr)
@@ -357,16 +374,17 @@ class ElevenLabsTTSEngine:
         self.api_key  = api_key
         self.voice_id = voice_id
 
-    def speak(self, text: str) -> None:
+    def speak(self, text: str, profile: Optional[SpeechProfile] = None) -> None:
         import requests
         headers = {
             "xi-api-key":   self.api_key,
             "Content-Type": "application/json",
         }
+        stability = profile.stability if profile else _NEUTRAL_PROFILE.stability
         payload = {
             "text":     text,
             "model_id": "eleven_multilingual_v2",
-            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+            "voice_settings": {"stability": stability, "similarity_boost": 0.75},
         }
         resp = requests.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}",
@@ -400,14 +418,20 @@ class TTSPlayer:
         text:     str,
         on_start: Optional[Callable] = None,
         on_done:  Optional[Callable] = None,
+        profile:  Optional[SpeechProfile] = None,
     ) -> None:
-        """Synthesise and play text. BLOCKING – call from a dedicated thread."""
+        """Synthesise and play text. BLOCKING – call from a dedicated thread.
+
+        `profile` (see core.sentiment_adapter.get_speech_profile) lets the
+        caller tone-match delivery — rate, pitch, or voice stability —
+        instead of always reading text at one flat, neutral pace. Omitted or
+        None reads exactly as before (each engine's own neutral default)."""
         try:
             with self._lock:
                 self._playing = True
             if on_start:
                 on_start()
-            self._engine.speak(text)
+            self._engine.speak(text, profile)
         except Exception as e:
             print(f"[TTS] Error: {e}")
         finally:

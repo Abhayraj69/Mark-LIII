@@ -236,9 +236,18 @@ def _refresh_cause_totals(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def get_links(min_support: int = DEFAULT_MIN_SUPPORT, db_path: Optional[Path] = None) -> list[CausalLink]:
+def get_links(min_support: int = DEFAULT_MIN_SUPPORT, db_path: Optional[Path] = None,
+              since: Optional[datetime] = None) -> list[CausalLink]:
     """All causal_links clearing `min_support`, with confidence and lift
-    computed fresh, sorted strongest-first (confidence * lift)."""
+    computed fresh, sorted strongest-first (confidence * lift).
+
+    `since`, when given, restricts this to links whose most recent
+    occurrence (`updated`) falls on or after that time — e.g. the weekly
+    causal-graph digest (actions/causal_insight.py) uses this to report
+    patterns actively seen in the last 7 days rather than the all-time
+    leaderboard. `support`/`confidence` on a `since`-filtered link are still
+    the all-time figures (this table doesn't keep a per-period count) — only
+    which links are included is time-restricted, not their stats."""
     conn = _connect(db_path)
     try:
         _refresh_cause_totals(conn)
@@ -248,10 +257,16 @@ def get_links(min_support: int = DEFAULT_MIN_SUPPORT, db_path: Optional[Path] = 
         }
         grand_total = sum(totals.values()) or 1
 
-        rows = conn.execute(
-            "SELECT * FROM causal_links WHERE support >= ? ORDER BY support DESC",
-            (min_support,),
-        ).fetchall()
+        if since is not None:
+            rows = conn.execute(
+                "SELECT * FROM causal_links WHERE support >= ? AND updated >= ? ORDER BY support DESC",
+                (min_support, since.isoformat(timespec="seconds")),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM causal_links WHERE support >= ? ORDER BY support DESC",
+                (min_support,),
+            ).fetchall()
 
         links = []
         for row in rows:

@@ -83,7 +83,6 @@ from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
-from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_voice, get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
     is_local_engine_enabled, get_plugin_config, get_plugin_setting,
@@ -1510,10 +1509,35 @@ class JarvisLive:
 
         if self._action_registry.has(action):
             asyncio.ensure_future(self._dispatch_tool(action, {}))
+        elif pattern_key.startswith("manual:"):
+            # A repeated-manual-steps suggestion names a sequence of steps
+            # ("step1 then step2"), not a single registered tool. Reconstruct
+            # the real {tool, args} calls behind it from the workflow log and
+            # save them as a manage_sequence macro, so accepting the hint
+            # gives the user a real one-click replay instead of dead-ending.
+            async def _save_as_macro():
+                steps = await asyncio.get_event_loop().run_in_executor(
+                    None, predictive_assistant.get_manual_sequence_steps, pattern_key,
+                )
+                if not steps:
+                    self.ui.write_log(
+                        f"SYS: Couldn't find the steps behind '{action}' to save as a macro."
+                    )
+                    return
+                name = suggestion.get("one_click_command") or "auto_sequence"
+                result = await self._dispatch_tool("manage_sequence", {
+                    "action": "save",
+                    "name": name,
+                    "steps": steps,
+                    "description": suggestion.get("reasoning", ""),
+                })
+                self.ui.write_log(f"SYS: {result}")
+
+            asyncio.ensure_future(_save_as_macro())
         else:
-            # A repeated-manual-steps suggestion names a sequence of steps,
-            # not a single registered tool — there's nothing to run yet, so
-            # say so instead of silently doing nothing.
+            # Neither a registered tool nor a reconstructable manual-step
+            # sequence — nothing to run yet, so say so instead of silently
+            # doing nothing.
             self.ui.write_log(f"SYS: '{action}' isn't wired to a runnable action yet.")
 
     async def _send_realtime(self):
@@ -1827,10 +1851,13 @@ class JarvisLive:
         """
         Two-phase briefing optimized for speed:
           Phase 1 — instant greeting (no tools) → speech starts in <1s
-          Phase 2 — news pre-fetched in a background thread while Phase 1 plays,
-                    delivered as ready text (no Gemini tool-call round-trip) and
-                    shown on the UI content panel. Waits for turn_complete event
-                    instead of a fixed sleep so there is no unnecessary gap.
+          Phase 2 — the consolidated morning brief (build_morning_brief: monitored-
+                    topic news, habit suggestions, recent-session context, and
+                    causal patterns) is assembled in a background thread while
+                    Phase 1 plays, then delivered as ready text (no Gemini tool-call
+                    round-trip) and shown on the UI content panel. Waits for
+                    turn_complete instead of a fixed sleep so there is no
+                    unnecessary gap.
         """
         memory   = load_memory()
         identity = memory.get("identity", {})
@@ -1843,9 +1870,11 @@ class JarvisLive:
         name = _val("name")
         time_str = datetime.now().strftime("%H:%M")
 
-        # Start fetching news immediately — runs in parallel while phase 1 plays
-        loop = asyncio.get_event_loop()
-        news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
+        # Start assembling the morning brief immediately — runs in a background
+        # thread (news lookups + DB queries) in parallel while phase 1 plays
+        loop  = asyncio.get_event_loop()
+        depth = await asyncio.to_thread(get_session_count)
+        brief_future = loop.run_in_executor(None, self._proactive.get_morning_brief, memory, depth)
 
         await asyncio.sleep(0.3)
         if not self.session:
@@ -1889,15 +1918,16 @@ class JarvisLive:
         self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
 
         # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
-        async def _deliver_news():
+        async def _deliver_brief():
             try:
                 lang_str = (f" Speak in {lang} unless the user has since "
                             f"spoken another language, in which case use theirs."
                             if lang else "")
 
-                # Wait for news fetch (already running) and Phase 1 turn-complete
-                # in parallel — whichever takes longer determines the wait time
-                news_done   = asyncio.wrap_future(news_future)
+                # Wait for the brief to finish assembling (already running) and
+                # Phase 1 turn-complete in parallel — whichever takes longer
+                # determines the wait time
+                brief_done  = asyncio.wrap_future(brief_future)
                 turn_waited = False
                 if self._turn_done_event:
                     try:
@@ -1916,38 +1946,33 @@ class JarvisLive:
                     await asyncio.sleep(1.0)
 
                 try:
-                    news_text = await asyncio.wait_for(news_done, timeout=4.0)
+                    brief_text = await asyncio.wait_for(brief_done, timeout=8.0)
                 except Exception:
-                    news_text = ""
+                    brief_text = ""
 
                 if not self.session:
                     return
 
-                if news_text and len(news_text) > 60:
+                if brief_text:
                     # Show on UI content panel immediately
-                    self.ui.show_content("NEWS — top world news today", news_text)
-
-                    p2 = (
-                        f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
-                        "Pick ONE headline, summarise it in one sentence, then say the full list "
-                        f"is displayed on screen. Do not call any tools.{lang_str}"
-                    )
+                    self.ui.show_content("MORNING BRIEF", brief_text)
+                    p2 = f"{brief_text}{lang_str}"
                 else:
                     p2 = (
-                        "News headlines could not be fetched right now. "
-                        f"Let the user know briefly.{lang_str}"
+                        "Nothing new to report right now — no news, patterns, or "
+                        f"context worth mentioning. Let the user know briefly.{lang_str}"
                     )
 
                 await self.session.send_client_content(
                     turns={"role": "user", "parts": [{"text": p2}]},
                     turn_complete=True,
                 )
-                self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
+                self.ui.write_log("SYS: Briefing phase 2 (morning brief) sent.")
             except Exception as e:
                 print(f"[Briefing] Phase 2 error: {e}")
                 self.ui.write_log(f"SYS: Briefing phase 2 failed: {e}")
 
-        asyncio.create_task(_deliver_news())
+        asyncio.create_task(_deliver_brief())
 
     # ── Session memory ──────────────────────────────────────────────────────────
 
@@ -2625,20 +2650,24 @@ class JarvisLive:
                 print(f"[ContextManager] ⚠️ build_context failed: {e}")
                 combined = ""
 
-            # Tone/verbosity/proactivity modifier — recent_texts lets it
-            # notice "I already told you" style repeats. build_style_modifier
-            # returns "" outright when the user has disabled adaptation in
+            # Tone/verbosity/proactivity modifier for the prompt, plus a
+            # SpeechProfile (rate/pitch/stability) for the TTS engine once the
+            # reply comes back — one detect+log call covers both, via
+            # evaluate() (see core/sentiment_adapter.py). recent_texts lets
+            # detection notice "I already told you" style repeats. Returns
+            # ("", None) outright when the user has disabled adaptation in
             # Settings, so a disabled toggle really means nothing touches the
-            # prompt, not "always neutral tone".
+            # prompt or the voice, not "always neutral".
+            speech_profile = None
             try:
-                style_text = await asyncio.get_event_loop().run_in_executor(
+                style_text, speech_profile = await asyncio.get_event_loop().run_in_executor(
                     None,
-                    lambda: sentiment_adapter.build_style_modifier(text, recent_texts=self._session_log),
+                    lambda: sentiment_adapter.evaluate(text, recent_texts=self._session_log),
                 )
                 if style_text:
                     combined = f"{combined}\n\n{style_text}" if combined else style_text
             except Exception as e:
-                print(f"[SentimentAdapter] ⚠️ build_style_modifier failed: {e}")
+                print(f"[SentimentAdapter] ⚠️ evaluate failed: {e}")
 
             messages[1]["content"] = combined
 
@@ -2712,7 +2741,9 @@ class JarvisLive:
                 messages.append({"role": "assistant", "content": reply})
                 self.set_speaking(True)
                 try:
-                    await asyncio.to_thread(tts_player.speak, reply)
+                    await asyncio.to_thread(
+                        lambda: tts_player.speak(reply, profile=speech_profile)
+                    )
                 except Exception as e:
                     print(f"[Local] TTS error: {e}")
                 self.set_speaking(False)
