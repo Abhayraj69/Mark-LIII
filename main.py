@@ -28,6 +28,21 @@ if _platform.system() == "Windows":
 # locale. `errors="replace"` is the belt and braces — a console that genuinely
 # cannot render a glyph shows a box instead of killing the process.
 import sys as _sys
+
+# Under pythonw.exe there is no console at all and sys.stdout/sys.stderr are
+# None. print() quietly no-ops on that, but library code that *inspects* the
+# stream does not: uvicorn's log formatter calls sys.stdout.isatty(), which
+# raises AttributeError, which logging.config turns into "Unable to configure
+# formatter 'default'" and the dashboard never starts. Handing those libraries
+# a real (discarding) stream keeps every such caller on its normal path.
+import io as _io
+import os as _os
+for _name in ("stdout", "stderr"):
+    if getattr(_sys, _name, None) is None:
+        setattr(_sys, _name, _io.TextIOWrapper(
+            open(_os.devnull, "wb"), encoding="utf-8", errors="replace", write_through=True
+        ))
+
 for _stream in (_sys.stdout, _sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -71,7 +86,7 @@ from actions.background_monitor import (
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_voice, get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
-    is_local_engine_enabled, get_plugin_config,
+    is_local_engine_enabled, get_plugin_config, get_plugin_setting,
 )
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
@@ -82,10 +97,30 @@ from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
 from core.local_control        import LocalControlServer
+from core                      import fast_intent
+from core                      import predictive_assistant
+from core                      import causal_reasoning
+from core                      import context_manager
+from core                      import sentiment_adapter
+from tool_connectors.registry  import ToolRegistry
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
 # again (wake-word mode only).
 WAKE_SLEEP_TIMEOUT = 120.0   # seconds (2 minutes)
+
+# _enter_standby() debounce: the mic keeps capturing in real time right through
+# the awake->asleep transition, so the wake detector's very first frames are
+# the acoustic tail of the "bye jarvis" the user just finished saying — room
+# reverb and decay, not silence. Without a settle window, that tail alone can
+# score as "Hey Jarvis" (same "...jarvis" sound) and re-wake JARVIS instantly.
+WAKE_SETTLE_SECONDS = 1.0
+# After a genuine wake, ignore a second shutdown_jarvis call for this long.
+# Backstops the same echo/tail problem from the other direction: if a stray
+# "jarvis"-ish sound both re-wakes the detector AND reaches the model as
+# audio, the model can reflexively re-call shutdown_jarvis a moment later
+# with no new, deliberate goodbye from the user. Short enough that a real,
+# fast second "bye jarvis" from the user is not a realistic case it blocks.
+STANDBY_REENTRY_GUARD_SECONDS = 2.5
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -246,10 +281,12 @@ TOOL_DECLARATIONS = [
     {
         "name": "shutdown_jarvis",
         "description": (
-            "Shuts down the assistant completely. "
-            "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
-            "The user can say this in ANY language."
+            "Goes quiet: stops speaking and stops treating audio or text as commands, "
+            "WITHOUT closing the app. Call this when the user says goodbye, tells you to "
+            "stop, or wants to end the conversation — e.g. 'bye Jarvis' — in ANY language. "
+            "This does NOT exit or shut down the program. JARVIS keeps running in the "
+            "background, muted, with all speech and on-screen activity suspended, and only "
+            "resumes normal conversation once the user says 'Hey Jarvis' again."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -397,9 +434,13 @@ class JarvisLive:
         self._interrupted          = False   # True while draining audio after user interrupt
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
+        self.ui.on_remote_tailscale_clicked = self._make_remote_key_tailscale
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
+        self.ui.on_suggestion_decision = self._on_suggestion_decision
+        self._suggestion_cooldown_until = 0.0  # monotonic time — throttles how often a hint can appear
+        self._last_suggested_pattern    = None  # pattern_key of the hint currently on screen, or last shown
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
 
@@ -458,6 +499,20 @@ class JarvisLive:
         self.ui.get_plugin_settings = self._settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
+        # tool_connectors/: a second registry (git/Docker/filesystem today),
+        # published alongside actions and plugins with the same reserved-name
+        # discipline. Declarations are namespaced "{connector}__{action}"
+        # (see ToolRegistry.get_tool_declarations), so a collision here would
+        # mean an action or plugin was deliberately named e.g. "git__commit" —
+        # reserved_names below catches that rather than silently shadowing it.
+        _names_incl_plugins = _core_names | {d["name"] for d in self._plugin_registry.get_tool_declarations()}
+        self._tool_connector_registry = ToolRegistry(
+            logger=lambda msg: (print(f"[Connectors] {msg}"), self.ui.write_log(f"SYS: {msg}")),
+        ).discover()
+        self._connector_declarations = self._tool_connector_registry.get_tool_declarations(
+            reserved_names=_names_incl_plugins
+        )
+
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
         # It is True whenever wake word is OFF, so default behaviour is unchanged.
@@ -465,6 +520,15 @@ class JarvisLive:
         self._awake            = not self._wake_enabled
         self._wake_detector: WakeWordDetector | None = None
         self._wake_sleep_timeout = WAKE_SLEEP_TIMEOUT
+        # Set only by _enter_standby() ("bye jarvis" on a session that never
+        # turned wake-word mode on) so wake() knows to put _wake_enabled back
+        # exactly as the user had it once they say "Hey Jarvis" again — the
+        # standby is a one-off detour, not a silent, permanent settings change.
+        self._standby_forced_wake         = False
+        self._standby_restore_wake_enabled = False
+        # See WAKE_SETTLE_SECONDS / STANDBY_REENTRY_GUARD_SECONDS above.
+        self._wake_feed_gate_open_at  = 0.0
+        self._standby_reentry_guard_until = 0.0
         # UI control surface for the Wake Word settings section.
         self.ui.wake_is_ready    = wake_is_ready          # () -> bool
         self.ui.wake_get_state   = self._wake_state       # () -> dict
@@ -499,10 +563,71 @@ class JarvisLive:
         if self._awake:
             return
         self._awake = True
+        # See STANDBY_REENTRY_GUARD_SECONDS: a stray echo of the acoustic
+        # tail that just caused this wake can otherwise read as a second,
+        # genuine "bye jarvis" a moment later and immediately re-sleep.
+        self._standby_reentry_guard_until = time.monotonic() + STANDBY_REENTRY_GUARD_SECONDS
+        if self._standby_forced_wake:
+            # Undo _enter_standby()'s temporary override now that its job is
+            # done, so a user who never turned wake-word mode on goes back to
+            # always-listening instead of being left in permanent sleep-until-
+            # "Hey Jarvis" mode by a single "bye jarvis".
+            self._wake_enabled       = self._standby_restore_wake_enabled
+            self._standby_forced_wake = False
         self._last_user_speech = time.monotonic()   # start the auto-sleep clock now
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
         self.ui.write_log(f"SYS: Awake — {reason}.")
+
+    def _enter_standby(self, reason: str = "bye jarvis") -> None:
+        """'bye jarvis' (or any explicit goodbye) no longer ends the process —
+        it mutes. Speech is cut off immediately, JARVIS stops treating mic
+        audio or typed text as commands, and it waits silently for "Hey
+        Jarvis" to resume — the exact same _awake gate that already drives
+        the wake-word auto-sleep timeout (see sleep()/_listen_audio), so
+        "muted" means one consistent thing everywhere in the app rather than
+        a second, parallel mechanism.
+
+        Works even if the user never turned wake-word mode on: it force-arms
+        the detector and flips _wake_enabled on for the duration of standby
+        (wake() restores it) so the existing awake/asleep gates, the WAKE NOW
+        button, and a live reconnect all treat this session correctly either
+        way.
+
+        Guarded against the two ways this loop was observed re-triggering
+        itself right after "bye jarvis": (1) STANDBY_REENTRY_GUARD_SECONDS
+        ignores a second call arriving immediately after a wake — that's an
+        echo, not a new goodbye; (2) WAKE_SETTLE_SECONDS (applied in the mic
+        callback / _local_wake_wait, not here) keeps the just-armed detector
+        from hearing the tail of THIS utterance as a fresh "Hey Jarvis"."""
+        if time.monotonic() < self._standby_reentry_guard_until:
+            self.ui.write_log(
+                "SYS: Ignoring an immediate repeat 'bye jarvis' — likely an "
+                "echo of the last one."
+            )
+            return
+        self.interrupt()   # stop mid-sentence speech now — no trailing audio
+        if not self._wake_enabled:
+            self._standby_restore_wake_enabled = self._wake_enabled
+            self._wake_enabled        = True
+            self._standby_forced_wake = True
+        detector_ready = self._ensure_wake_detector()
+        if detector_ready and self._wake_detector is not None:
+            # Without this, "bye jarvis" only behaves correctly the FIRST
+            # time per process: the detector's internal audio buffer is left
+            # frozen mid-"hey jarvis" from whatever wake last fed it, and a
+            # few fresh frames layered on top of that stale buffer can score
+            # as an immediate false "Hey Jarvis" the moment feeding resumes
+            # (see WakeWordDetector.start()'s docstring for the mechanism).
+            self._wake_detector.reset()
+        self.sleep(reason=reason)
+        self._wake_feed_gate_open_at = time.monotonic() + WAKE_SETTLE_SECONDS
+        if not detector_ready:
+            self.ui.write_log(
+                "SYS: Note — the 'Hey Jarvis' wake model isn't downloaded, so "
+                "I won't hear you to wake back up. Use the WAKE NOW button in "
+                "the HUD, or set up wake word once in ⚙ → WAKE WORD."
+            )
 
     def sleep(self, reason: str = "timeout") -> None:
         if not self._awake:
@@ -593,7 +718,96 @@ class JarvisLive:
     # would use.
 
     def _settings_schemas(self) -> list[dict]:
-        return [self._engine_settings_section()] + self._plugin_registry.settings_schemas()
+        return ([self._engine_settings_section(), self._claude_settings_section(),
+                  self._fast_commands_section(), self._sentiment_settings_section()]
+                + self._plugin_registry.settings_schemas())
+
+    # ── Claude collaboration mode (core/claude_bridge.py) ─────────────────────
+    # Same generic PluginSettingsOverlay rendering as ENGINE/TONE ADAPTATION
+    # above — no new Qt code. Unlike ENGINE, this toggle needs no restart: it's
+    # read fresh via is_claude_engine_enabled() each time dev_agent/code_helper
+    # pick a model, not cached at session start.
+    def _claude_settings_section(self) -> dict:
+        return {
+            "plugin":    "claude_engine",
+            "namespace": "claude_engine",
+            "title":     "🤝 CLAUDE COLLAB MODE — Claude backs dev_agent/code_helper",
+            "fields": [
+                {"key": "enabled", "type": "toggle",
+                 "label": "Use Claude instead of Gemini for dev_agent/code_helper text generation",
+                 "default": False},
+                {"key": "api_key", "type": "password", "label": "Anthropic API key",
+                 "default": "", "placeholder": "sk-ant-..."},
+                {"key": "model", "type": "text", "label": "Model",
+                 "default": "claude-sonnet-5", "placeholder": "claude-sonnet-5"},
+                {"key": "max_tokens", "type": "text", "label": "Max reply tokens",
+                 "default": "1024"},
+            ],
+            "values": get_plugin_config("claude_engine"),
+            "action": {"label": "TEST CONNECTION", "run": self._test_claude_engine},
+        }
+
+    def _test_claude_engine(self, values: dict) -> tuple[bool, str]:
+        """Off-thread reachability probe for the settings panel's TEST button —
+        checks the key the user just typed, before they even save, with the
+        smallest possible real request (max_tokens=1) since Anthropic has no
+        unauthenticated health endpoint to ping."""
+        import requests
+        from core.claude_bridge import ANTHROPIC_VERSION, API_URL
+
+        api_key = str(values.get("api_key") or "").strip()
+        model   = str(values.get("model") or "claude-sonnet-5").strip()
+        if not api_key:
+            return False, "No API key entered."
+        try:
+            resp = requests.post(
+                API_URL,
+                json={"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]},
+                headers={
+                    "x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION,
+                    "content-type": "application/json",
+                },
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                return True, f"Reachable — '{model}' responded."
+            detail = ""
+            try:
+                detail = resp.json().get("error", {}).get("message", "")
+            except Exception:
+                pass
+            return False, f"HTTP {resp.status_code}: {detail}".strip()
+        except Exception as e:
+            return False, f"Request failed: {e}"
+
+    def _sentiment_settings_section(self) -> dict:
+        return {
+            "plugin":    "sentiment_adapter",
+            "namespace": "sentiment_adapter",
+            "title":     "🎭 TONE ADAPTATION — adjust style to your mood",
+            "fields": [
+                {"key": "enabled", "type": "toggle",
+                 "label": "Adjust tone/verbosity to detected mood (never changes facts or safety)",
+                 "default": True},
+                {"key": "persist_history", "type": "toggle",
+                 "label": "Remember detected mood signals across sessions (off = this session only)",
+                 "default": False},
+            ],
+            "values": get_plugin_config("sentiment_adapter"),
+        }
+
+    def _fast_commands_section(self) -> dict:
+        return {
+            "plugin":    "fast_commands",
+            "namespace": "fast_commands",
+            "title":     "⚡ FAST COMMANDS — skip the model for fixed actions",
+            "fields": [
+                {"key": "enabled", "type": "toggle",
+                 "label": "Run typed device commands locally (instant)",
+                 "default": True},
+            ],
+            "values": get_plugin_config("fast_commands"),
+        }
 
     def _engine_settings_section(self) -> dict:
         return {
@@ -683,18 +897,115 @@ class JarvisLive:
         )
         raise _ReconnectSignal(keep_context=keep)
 
+    def _log_dashboard_unavailable(self):
+        """The dashboard can be absent for two very different reasons, and
+        telling the user to pip-install packages they already have sends them
+        down the wrong path. If it died while starting, show what actually
+        killed it."""
+        why = getattr(self, "_dashboard_error", "")
+        self.ui.write_log(
+            f"SYS: Dashboard unavailable — {why}" if why else
+            "SYS: Dashboard unavailable. "
+            "Run: pip install fastapi \"uvicorn[standard]\" cryptography"
+        )
+
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
         if self._dashboard is None:
-            self.ui.write_log(
-                "SYS: Dashboard unavailable. "
-                "Run: pip install fastapi \"uvicorn[standard]\" cryptography"
-            )
+            self._log_dashboard_unavailable()
             return None
         key    = self._dashboard.new_key()
         url    = self._dashboard.get_url()
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
+
+    def _make_remote_key_tailscale(self):
+        """Reads this PC's Tailscale address and pairs the phone dashboard
+        against it — same login flow (QR/6-digit key) as the LAN Remote
+        Control, just reachable from anywhere with internet via the private
+        tailnet instead of only this Wi-Fi. Unlike the Cloudflare Tunnel
+        this replaced, there's no process to start or wait on here: once
+        Tailscale reports an address it's already routable, so this only
+        ever shells out to read status. Still called off the Qt thread (see
+        ui.py's threaded button handler) since that's still a subprocess call."""
+        if self._dashboard is None:
+            self._log_dashboard_unavailable()
+            return None
+        from dashboard.server import PORT
+        from dashboard import tailscale as ts
+
+        state = ts.login_state()
+        if state == "missing":
+            self.ui.write_log(
+                "SYS: Tailscale isn't installed. Install it once with:\n"
+                f"    {ts.install_hint()}\n"
+                "then sign in on this PC (tailscale up) and install/sign in "
+                "on your phone too, then click this button again."
+            )
+            return None
+        if state == "needs_login":
+            self.ui.write_log(
+                "SYS: Tailscale is installed but not signed in. Run 'tailscale up' "
+                "and follow the login link, then click this button again."
+            )
+            return None
+        if state == "unknown":
+            self.ui.write_log("SYS: Could not read Tailscale status — is the service running?")
+            return None
+
+        ip, dns = ts.get_address()
+        if not ip:
+            self.ui.write_log("SYS: Tailscale has no address for this device yet — try again shortly.")
+            return None
+
+        host = dns or ip
+        base = f"http://{host}:{PORT}"
+        key  = self._dashboard.new_key()
+        return base, key, f"{base}/auto-login?key={key}", base, True
+
+    # ── fast local commands ─────────────────────────────────────────────────
+
+    def _try_fast_intent(self, text: str) -> bool:
+        """Run `text` locally if it is an unambiguous device command, skipping
+        the model round trip entirely. Returns True if it was handled here.
+
+        Thread-safe: called from the Qt thread (typed box) and from the async
+        loop (phone). Detection itself is a handful of regex matches, so it is
+        cheap enough to attempt on every typed command; a miss returns False
+        and the caller takes the normal path unchanged."""
+        if not self._loop:
+            return False
+        if not get_plugin_setting("fast_commands", "enabled", True):
+            return False
+        intent = fast_intent.detect(text)
+        if intent is None:
+            return False
+        asyncio.run_coroutine_threadsafe(self._run_fast_intent(intent), self._loop)
+        return True
+
+    async def _run_fast_intent(self, intent: "fast_intent.Intent") -> None:
+        self.ui.set_state("THINKING")
+        result = await self._dispatch_tool(intent.tool, dict(intent.args))
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
+
+        failed = result.startswith(("Tool '", "Unknown tool:", "Action '"))
+        self.ui.write_log(f"ERR: {result}" if failed else f"JARVIS: {intent.reply}")
+
+        # Tell the model what just happened so follow-ups ("do that again",
+        # "put it back") still make sense. turn_complete=False appends to the
+        # conversation WITHOUT asking for a reply — the action has already run
+        # and been confirmed on screen, so a spoken answer here would only add
+        # back the latency this path exists to remove.
+        if self.session:
+            try:
+                await self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text":
+                        f"[Executed locally] {intent.tool}({intent.args}) → {result}"}]},
+                    turn_complete=False,
+                )
+            except Exception:
+                pass
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -704,6 +1015,8 @@ class JarvisLive:
         # "Hey Jarvis" or the WAKE NOW button.
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
+            return
+        if self._try_fast_intent(text):
             return
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
@@ -833,6 +1146,7 @@ class JarvisLive:
             TOOL_DECLARATIONS
             + self._action_registry.get_tool_declarations()
             + self._plugin_registry.get_tool_declarations()
+            + self._connector_declarations
         )
 
     def _build_config(self) -> types.LiveConnectConfig:
@@ -894,6 +1208,16 @@ class JarvisLive:
                 response={"result": "ok", "silent": True}
             )
 
+        if name == "shutdown_jarvis":
+            # `silent: True` (see save_memory above) tells the Live API not to
+            # generate a spoken turn for this — a text instruction alone is
+            # not a hard enough guarantee for "zero trailing speech".
+            self._enter_standby(reason="bye jarvis")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "muted until 'Hey Jarvis'", "silent": True}
+            )
+
         result = await self._dispatch_tool(name, args)
 
         if not self.ui.muted:
@@ -917,8 +1241,9 @@ class JarvisLive:
         duplicating this router. Returns the plain string result — the two
         callers wrap it differently (a Gemini FunctionResponse here, a
         {"role": "tool", ...} message in local mode)."""
-        loop   = asyncio.get_event_loop()
-        result = "Done."
+        loop    = asyncio.get_event_loop()
+        result  = "Done."
+        success = True
 
         # Vision needs a live multimodal session to inject the captured image
         # into (see _receive_audio's turn_complete handling) — Local Mode's
@@ -1007,29 +1332,25 @@ class JarvisLive:
                 else:
                     result = "Specify action (add/remove/list) and a topic."
 
-            elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                async def _do_shutdown():
-                    await self._save_session_summary()
-                    if self.session:
-                        try:
-                            await self.session.send_client_content(
-                                turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
-                                turn_complete=True,
-                            )
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.5)
-                    import os as _os
-                    _os._exit(0)
-                asyncio.create_task(_do_shutdown())
-
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given
                 if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
                     args["file_path"] = self.ui.current_file
+
+                def _dispatch_sync(step_name: str, step_args: dict) -> str:
+                    """Blocking (tool_name, args) -> str re-entry into this same
+                    router, for actions that need to run other tools as steps
+                    (e.g. sequence replay in actions/sequence_recall.py). Runs on
+                    the caller's worker thread; hands the actual coroutine to the
+                    event loop and blocks only this thread, not the loop."""
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._dispatch_tool(step_name, dict(step_args or {})), loop
+                    )
+                    return future.result(timeout=120)
+
                 _ctx = {"player": self.ui, "speak": self.speak,
-                        "response": None, "session_memory": None}
+                        "response": None, "session_memory": None,
+                        "dispatch": _dispatch_sync}
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
                 # web_search: mirror results to the on-screen content panel
@@ -1042,21 +1363,158 @@ class JarvisLive:
                     self.ui.show_content(_label, r)
 
             else:
+                _connector_target = self._tool_connector_registry.has_declaration(name)
                 if self._plugin_registry.has(name):
                     r = await loop.run_in_executor(
                         None,
                         lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
                     )
                     result = r or "Done."
+                elif _connector_target:
+                    # READ_ONLY runs and returns its result inline; REVERSIBLE/
+                    # DESTRUCTIVE instead comes back as a "[CONFIRMATION_PENDING]"
+                    # sentence for the model to relay — the registry itself
+                    # decides which, via core.confirm — exactly like
+                    # shutdown_jarvis above, just one layer further down.
+                    connector_name, connector_action = _connector_target
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: self._tool_connector_registry.execute(connector_name, connector_action, args),
+                    )
+                    result = r or "Done."
                 else:
                     result = f"Unknown tool: {name}"
 
         except Exception as e:
-            result = f"Tool '{name}' failed: {e}"
+            result  = f"Tool '{name}' failed: {e}"
+            success = False
             traceback.print_exc()
             self.speak_error(name, e)
 
+        # Feed the Predictive Assistant. Best-effort: a logging hiccup must
+        # never surface as a dispatch failure, so it's swallowed rather than
+        # propagated. save_memory/recall_memory return early above and are
+        # deliberately not logged here — they aren't user-facing "actions" in
+        # the sense the pattern detectors care about.
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: predictive_assistant.log_event(
+                    action_type=name,
+                    context=self.ui.current_file or "",
+                    input_data=str(args)[:500],
+                    output=str(result)[:500],
+                    success=success,
+                ),
+            )
+        except Exception:
+            pass
+
+        # Mirror the same dispatch into the causal-reasoning timeline (see
+        # core/causal_reasoning.py) so tool calls and screen_monitor alerts
+        # share one cause-and-effect graph instead of two disconnected logs.
+        # Best-effort for the same reason as the block above: a reasoning
+        # side-channel must never be able to fail a real tool dispatch.
+        if success:
+            try:
+                await loop.run_in_executor(
+                    None, lambda: causal_reasoning.record_event(f"tool:{name}")
+                )
+            except Exception:
+                pass
+
+        self._maybe_show_suggestion()
+
         return result
+
+    def _log_context_turn(self, role: str, content: str) -> None:
+        """Fire-and-forget persistence into context_manager's durable turn
+        store (separate from self._session_log, which only lives for the
+        current session/summary) — used from both the Live audio pipeline
+        and Local Mode's text loop so semantic recall works across sessions
+        no matter which engine produced the turn. Best-effort: a storage
+        hiccup must never stall speech or transcription."""
+        async def _do():
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: context_manager.log_turn(role, content)
+                )
+            except Exception as e:
+                print(f"[ContextManager] ⚠️ log_turn failed: {e}")
+        asyncio.ensure_future(_do())
+
+    def _maybe_show_suggestion(self) -> None:
+        """Throttled check for a proactive hint worth surfacing. Runs the
+        (cheap, frequency-based) pattern detectors off the Qt/asyncio thread
+        and, if something above threshold turns up and isn't the same pattern
+        already on screen, raises it as a dismissible SuggestionHint — never
+        auto-executed, see _on_suggestion_decision below."""
+        now = time.monotonic()
+        if now < self._suggestion_cooldown_until:
+            return
+        # However this resolves, don't check again for a while — a hit keeps
+        # the hint from being spammed, a miss avoids re-running the detectors
+        # on every single tool call.
+        self._suggestion_cooldown_until = now + 120.0
+
+        def _check():
+            try:
+                return predictive_assistant.get_proactive_suggestions(
+                    current_context=self.ui.current_file or ""
+                )
+            except Exception as e:
+                print(f"[PredictiveAssistant] ⚠️ suggestion check failed: {e}")
+                return []
+
+        async def _run():
+            suggestions = await asyncio.get_event_loop().run_in_executor(None, _check)
+            if not suggestions:
+                return
+            top = suggestions[0]
+            if top.pattern_key == self._last_suggested_pattern:
+                return  # already shown (and presumably dismissed/ignored) recently
+            self._last_suggested_pattern = top.pattern_key
+            self.ui.show_suggestion(
+                {
+                    "action": top.action,
+                    "confidence_score": top.confidence_score,
+                    "reasoning": top.reasoning,
+                    "one_click_command": top.one_click_command,
+                    "pattern_key": top.pattern_key,
+                }
+            )
+
+        asyncio.ensure_future(_run())
+
+    def _on_suggestion_decision(self, accepted: bool, suggestion: dict) -> None:
+        """UI callback for the SuggestionHint's RUN/DISMISS buttons. RUN is the
+        explicit human confirmation the spec requires — nothing here ever
+        fires without it. Runs the underlying tool through the exact same
+        registry _dispatch_tool already uses, so an accepted suggestion behaves
+        identically to the user asking for it out loud."""
+        pattern_key = suggestion.get("pattern_key", "")
+        action      = suggestion.get("action", "")
+
+        async def _record():
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: predictive_assistant.record_suggestion_feedback(
+                    pattern_key, action, accepted,
+                    context=self.ui.current_file or "",
+                ),
+            )
+        asyncio.ensure_future(_record())
+
+        if not accepted:
+            return
+
+        if self._action_registry.has(action):
+            asyncio.ensure_future(self._dispatch_tool(action, {}))
+        else:
+            # A repeated-manual-steps suggestion names a sequence of steps,
+            # not a single registered tool — there's nothing to run yet, so
+            # say so instead of silently doing nothing.
+            self.ui.write_log(f"SYS: '{action}' isn't wired to a runnable action yet.")
 
     async def _send_realtime(self):
         while True:
@@ -1087,7 +1545,12 @@ class JarvisLive:
             # is off (default) or we're awake, this is a single boolean check.
             if self._wake_enabled and not self._awake:
                 det = self._wake_detector
-                if det is not None:
+                # WAKE_SETTLE_SECONDS: drop, don't feed, for a moment after
+                # going to sleep — otherwise the detector's first frames are
+                # the acoustic tail of the utterance that just put it to
+                # sleep ("...jarvis" fading out), which can score as a fresh
+                # "Hey Jarvis" and wake it right back up.
+                if det is not None and time.monotonic() >= self._wake_feed_gate_open_at:
                     det.feed(indata)
                 return
             with self._speaking_lock:
@@ -1212,6 +1675,7 @@ class JarvisLive:
                             if full_in:
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
+                                self._log_context_turn("user", full_in)
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
@@ -1224,6 +1688,7 @@ class JarvisLive:
                             if full_out:
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                self._log_context_turn("assistant", full_out)
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -1673,11 +2138,13 @@ class JarvisLive:
                     # has no desktop WAKE button — so it wakes JARVIS if asleep.
                     if self._wake_enabled and not self._awake:
                         self.wake(reason="remote command")
+                    self.ui.write_log(f"[Web]: {text}")
+                    if self._try_fast_intent(text):
+                        continue
                     await self.session.send_client_content(
                         turns={"role": "user", "parts": [{"text": text}]},
                         turn_complete=True,
                     )
-                    self.ui.write_log(f"[Web]: {text}")
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
             except asyncio.TimeoutError:
@@ -1717,7 +2184,28 @@ class JarvisLive:
             from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
-            asyncio.create_task(self._dashboard.serve())
+
+            async def _run_dashboard():
+                # asyncio.create_task() below only SCHEDULES this coroutine —
+                # an exception raised once it's actually running (e.g.
+                # uvicorn failing to bind the port because something else
+                # already holds it) is not caught by this method's own
+                # try/except, which only covers the synchronous setup above.
+                # Uncaught, it would vanish into asyncio's default "Task
+                # exception was never retrieved" handler — silent, because
+                # JARVIS runs under pythonw.exe with no console to print it
+                # to. The result: a phone user gets a QR code / remote link
+                # pointing at a dashboard that was never actually listening,
+                # with zero indication anything went wrong — "this site
+                # can't be reached" and no clue why.
+                try:
+                    await self._dashboard.serve()
+                except Exception as e:
+                    self.ui.write_log(f"ERR: Dashboard failed to start — {e}")
+                    self._dashboard_error = str(e)
+                    self._dashboard = None
+
+            asyncio.create_task(_run_dashboard())
             # Runs for the whole lifetime, not just inside an active session
             asyncio.create_task(self._process_dashboard_commands())
         except Exception as e:
@@ -1933,6 +2421,49 @@ class JarvisLive:
     # behaviour (session resumption, proactive audio) are unavailable here,
     # and _dispatch_tool already says so rather than pretending to work.
 
+    async def _local_wake_wait(self) -> None:
+        """While asleep in Local Mode, actually listen for "Hey Jarvis"
+        instead of just polling the _awake flag. Local Mode has no persistent
+        mic stream the way the cloud path's _listen_audio does — normally
+        each utterance opens its own short-lived InputStream via
+        _record_utterance — so without this, a detector armed by
+        _enter_standby()/_ui_wake_toggle would sit fed with silence forever
+        and "Hey Jarvis" could never fire here. Opens one stream and waits
+        (with a timeout so a wedged stream can't hang the loop) rather than
+        looping open/close on every poll."""
+        det = self._wake_detector
+        if det is None or not det.ready:
+            await asyncio.sleep(0.5)
+            return
+        woke = asyncio.Event()
+        loop = asyncio.get_event_loop()
+
+        def callback(indata, frames, time_info, status):
+            # Same settle window as the cloud path's mic callback (see
+            # WAKE_SETTLE_SECONDS) — skip feeding the tail of the utterance
+            # that just triggered sleep, so it can't immediately re-wake us.
+            if time.monotonic() >= self._wake_feed_gate_open_at:
+                det.feed(indata)
+            if self._awake:
+                loop.call_soon_threadsafe(woke.set)
+
+        _mic_name = get_input_device()
+        _mic_dev  = audio_devices.resolve(_mic_name, "input")
+        try:
+            stream = sd.InputStream(
+                samplerate=SEND_SAMPLE_RATE, channels=CHANNELS, dtype="int16",
+                blocksize=CHUNK_SIZE, device=_mic_dev, callback=callback,
+            )
+        except Exception as e:
+            self.ui.write_log(f"ERR: Could not open mic to listen for 'Hey Jarvis': {e}")
+            await asyncio.sleep(2.0)
+            return
+        with stream:
+            try:
+                await asyncio.wait_for(woke.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                pass
+
     async def _record_utterance(self, max_secs: float = 15.0) -> np.ndarray:
         """Record from the mic until ~700 ms of silence following detected
         speech, or `max_secs` as a hard cap. Returns float32 mono @16kHz,
@@ -2036,11 +2567,14 @@ class JarvisLive:
             self._awake = True
             self.ui.write_log("SYS: JARVIS online (Local Mode).")
 
-        messages: list[dict] = [{"role": "system", "content": self._assemble_system_prompt()}]
+        messages: list[dict] = [
+            {"role": "system", "content": self._assemble_system_prompt()},
+            {"role": "system", "content": ""},  # reserved: refreshed with the ContextBundle each turn, not appended
+        ]
 
         while True:
             if self._wake_enabled and not self._awake:
-                await asyncio.sleep(0.2)
+                await self._local_wake_wait()
                 continue
 
             if not self.ui.muted:
@@ -2072,7 +2606,42 @@ class JarvisLive:
 
             self.ui.write_log(f"You: {text}")
             self._session_log.append(f"User: {text}")
+            self._log_context_turn("user", text)
             self._last_user_speech = time.monotonic()
+
+            # Refresh the reserved context slot (messages[1]) right before
+            # this turn is sent — session recency, project facts, and
+            # semantically-relevant past turns, structured so the model can
+            # tell them apart from the live conversation instead of getting
+            # one undifferentiated dump. Best-effort: a context-build failure
+            # falls back to the empty placeholder rather than blocking the turn.
+            try:
+                bundle = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: context_manager.build_context(text, session_log=self._session_log),
+                )
+                combined = bundle.to_prompt()
+            except Exception as e:
+                print(f"[ContextManager] ⚠️ build_context failed: {e}")
+                combined = ""
+
+            # Tone/verbosity/proactivity modifier — recent_texts lets it
+            # notice "I already told you" style repeats. build_style_modifier
+            # returns "" outright when the user has disabled adaptation in
+            # Settings, so a disabled toggle really means nothing touches the
+            # prompt, not "always neutral tone".
+            try:
+                style_text = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: sentiment_adapter.build_style_modifier(text, recent_texts=self._session_log),
+                )
+                if style_text:
+                    combined = f"{combined}\n\n{style_text}" if combined else style_text
+            except Exception as e:
+                print(f"[SentimentAdapter] ⚠️ build_style_modifier failed: {e}")
+
+            messages[1]["content"] = combined
+
             messages.append({"role": "user", "content": text})
 
             try:
@@ -2083,6 +2652,7 @@ class JarvisLive:
 
             # Tool-calling loop — capped so a model stuck calling tools can
             # never spin forever.
+            standby_entered = False
             for _ in range(5):
                 tool_calls = resp.get("tool_calls") or []
                 if not tool_calls:
@@ -2103,13 +2673,16 @@ class JarvisLive:
                             args = {}
 
                     if name == "shutdown_jarvis":
-                        self.ui.write_log("SYS: Shutdown requested.")
-                        try:
-                            await asyncio.to_thread(tts_player.speak, "Goodbye, sir.")
-                        except Exception:
-                            pass
-                        import os as _os
-                        _os._exit(0)
+                        # Mute, don't exit — see _enter_standby(). No LLM call
+                        # and no TTS after this: skip straight back to the top
+                        # of the outer loop, where the _awake gate takes over.
+                        self._enter_standby(reason="bye jarvis")
+                        messages.append({
+                            "role": "tool", "tool_call_id": tc.get("id", ""),
+                            "name": name, "content": "muted until 'Hey Jarvis'",
+                        })
+                        standby_entered = True
+                        break
 
                     print(f"[JARVIS] 🔧 {name}  {args}")
                     self.ui.set_state("THINKING")
@@ -2119,6 +2692,8 @@ class JarvisLive:
                         "role": "tool", "tool_call_id": tc.get("id", ""),
                         "name": name, "content": str(tool_result),
                     })
+                if standby_entered:
+                    break
                 try:
                     resp = await asyncio.to_thread(llm_client.call_llm, messages, openai_tools)
                 except Exception as e:
@@ -2126,10 +2701,14 @@ class JarvisLive:
                     resp = {"content": "", "tool_calls": []}
                     break
 
+            if standby_entered:
+                continue
+
             reply = (resp.get("content") or "").strip()
             if reply:
                 self.ui.write_log(f"{self._asst_name}: {reply}")
                 self._session_log.append(f"{self._asst_name}: {reply}")
+                self._log_context_turn("assistant", reply)
                 messages.append({"role": "assistant", "content": reply})
                 self.set_speaking(True)
                 try:

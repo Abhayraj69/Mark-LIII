@@ -16,8 +16,11 @@ same one-file operation as writing a plugin: define ``TOOL`` and a handler.
     }
 
 The handler is invoked through signature introspection: it receives ``parameters``
-plus whichever of ``player`` / ``speak`` / ``response`` / ``session_memory`` it
-actually declares — so existing action signatures work unchanged.
+plus whichever of ``player`` / ``speak`` / ``response`` / ``session_memory`` /
+``dispatch`` it actually declares — so existing action signatures work unchanged.
+``dispatch`` is a ``(tool_name, args) -> str`` callable that re-enters main.py's
+own tool router, letting one action (e.g. sequence replay) invoke other tools
+by name without a second dispatch mechanism.
 
 Discovery runs once at startup; import errors, validation errors, and name
 collisions are logged and the offending file is skipped — they NEVER raise out
@@ -36,7 +39,7 @@ from typing import Callable, Optional
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
-_CTX_KEYS = ("player", "speak", "response", "session_memory")
+_CTX_KEYS = ("player", "speak", "response", "session_memory", "dispatch")
 
 
 @dataclass
