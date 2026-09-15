@@ -94,6 +94,23 @@
     .fc-dl { display:block; margin-top:6px; font-size:11px; color:var(--accent); text-decoration:none; font-weight:600; }
     .fc-dl:hover { opacity: 0.8; }
 
+    /* ── REMOTE STATE SHEET ── */
+    #sheet { flex-shrink:0; display:none; flex-direction:column; gap:8px; padding:10px 14px 0; background:rgba(7,9,15,0.97); }
+    #sheet.show { display:flex; }
+    .sheet-row { display:flex; align-items:center; gap:10px; border-radius:10px; padding:9px 12px; font-size:12.5px; }
+    .sheet-confirm { background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.35); }
+    .sheet-undo, .sheet-suggestion { background:var(--surface); border:1px solid var(--border); }
+    .sheet-suggestion { background:var(--adim); border-color:rgba(99,102,241,0.3); }
+    .sheet-text { flex:1; min-width:0; color:var(--text); }
+    .sheet-title { font-weight:700; }
+    .sheet-confirm .sheet-title { color:#f87171; }
+    .sheet-detail { font-size:11px; color:var(--muted); margin-top:2px; }
+    .sheet-btn { padding:7px 12px; border:none; border-radius:8px; font-size:10.5px; font-weight:700; letter-spacing:0.6px; cursor:pointer; flex-shrink:0; }
+    .sheet-btn:active { transform:scale(0.95); }
+    .sheet-btn.accept  { background:var(--green); color:#04150a; }
+    .sheet-btn.decline { background:rgba(255,255,255,0.08); color:var(--muted); }
+    .sheet-btn.danger  { background:#ef4444; color:#2a0505; }
+
     /* ── FOOTER ── */
     footer { flex-shrink:0; padding:10px 14px; border-top:1px solid var(--border); background:rgba(7,9,15,0.95); display:flex; gap:8px; align-items:center; }
     #inp { flex:1; padding:11px 14px; background:var(--surface); border:1.5px solid var(--border); border-radius:12px; color:var(--text); font-size:14px; outline:none; transition:border-color 0.15s; }
@@ -153,6 +170,7 @@
     <div class="url">__IP__:__PORT__</div>
   </header>
   <main id="feed"></main>
+  <div id="sheet"></div>
   <footer>
     <input id="inp" placeholder="Send a command to JARVIS…" autocomplete="off">
     <label class="btn-attach" for="file-inp" title="Send file">📎</label>
@@ -230,7 +248,75 @@
       if (m.type === 'wake')          sys('Wake word detected — connecting…');
       if (m.type === 'sys')           sys(m.text);
       if (m.type === 'file_received') _onFileReceived(m);
+      if (m.type === 'state')         applyRemoteState(m);
     };
+
+    // ── Remote state: confirm / undo / suggestion bottom sheet ────────────────
+    const sheet = document.getElementById('sheet');
+    let _remoteState = { confirm: null, undo: [], suggestion: null };
+
+    function applyRemoteState(m) {
+      _remoteState = { confirm: m.confirm || null, undo: m.undo || [], suggestion: m.suggestion || null };
+      renderSheet();
+    }
+
+    function renderSheet() {
+      const rows = [];
+      if (_remoteState.confirm) {
+        const c = _remoteState.confirm;
+        rows.push(`<div class="sheet-row sheet-confirm">
+          <div class="sheet-text"><div class="sheet-title">${esc(c.title || '')}</div>
+          <div class="sheet-detail">${esc(c.detail || '')}</div></div>
+          <button class="sheet-btn danger" onclick="doConfirm('${c.key}', true)">CONFIRM</button>
+          <button class="sheet-btn decline" onclick="doConfirm('${c.key}', false)">CANCEL</button>
+        </div>`);
+      }
+      if (_remoteState.undo && _remoteState.undo.length) {
+        rows.push(`<div class="sheet-row sheet-undo">
+          <div class="sheet-text">Last: ${esc(_remoteState.undo[0])}</div>
+          <button class="sheet-btn decline" onclick="doUndo()">UNDO</button>
+        </div>`);
+      }
+      if (_remoteState.suggestion) {
+        const s = _remoteState.suggestion;
+        rows.push(`<div class="sheet-row sheet-suggestion">
+          <div class="sheet-text"><div class="sheet-title">${esc(s.action || '')}</div>
+          <div class="sheet-detail">${esc(s.reasoning || '')}</div></div>
+          <button class="sheet-btn accept" onclick="doSuggestion(true)">ACCEPT</button>
+          <button class="sheet-btn decline" onclick="doSuggestion(false)">DISMISS</button>
+        </div>`);
+      }
+      sheet.innerHTML = rows.join('');
+      sheet.className = rows.length ? 'show' : '';
+    }
+
+    async function doConfirm(id, accept) {
+      try {
+        const r = await _authFetch('/api/confirm', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, accept }),
+        });
+        const j = await r.json();
+        if (!j.ok) toast('That confirmation already resolved elsewhere.');
+      } catch { toast('Could not reach JARVIS.'); }
+    }
+
+    async function doUndo() {
+      try {
+        const r = await _authFetch('/api/undo', { method: 'POST' });
+        const j = await r.json();
+        if (j.message) toast(j.message);
+      } catch { toast('Could not reach JARVIS.'); }
+    }
+
+    async function doSuggestion(accept) {
+      try {
+        await _authFetch('/api/suggestion', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ accept }),
+        });
+      } catch { toast('Could not reach JARVIS.'); }
+    }
 
     function setStatus(s) {
       if (s === 'active') {

@@ -159,3 +159,13 @@ def pending_title() -> str:
         if time.monotonic() - _pending.at > TIMEOUT_SECONDS:
             return ""
         return _pending.title
+
+
+def pending_info() -> Optional[dict]:
+    """{"key", "title", "detail"} for the currently pending confirmation, or
+    None — the read-only view the dashboard's remote-state broadcast sends to
+    the phone so its bottom sheet can show the same banner the HUD does."""
+    with _lock:
+        if _pending is None or time.monotonic() - _pending.at > TIMEOUT_SECONDS:
+            return None
+        return {"key": _pending.key, "title": _pending.title, "detail": _pending.detail}

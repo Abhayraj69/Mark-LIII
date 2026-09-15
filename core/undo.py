@@ -56,6 +56,25 @@ class _Entry:
 _stack: list[_Entry] = []
 _lock = threading.Lock()
 
+# Optional callback fired after every mutation (push or pop) — main.py binds
+# this once to re-broadcast dashboard state, so the phone's undo button stays
+# in sync without polling. Not a queue of events, just "something changed,
+# go re-read history()" — cheap and never blocks the caller that mutated it.
+_on_change: Callable[[], None] | None = None
+
+
+def bind(on_change: Callable[[], None]) -> None:
+    global _on_change
+    _on_change = on_change
+
+
+def _notify() -> None:
+    if _on_change is not None:
+        try:
+            _on_change()
+        except Exception as e:                              # pragma: no cover
+            print(f"[Undo] on_change callback failed: {e}")
+
 
 def push_undo(label: str, undo_fn: Callable[[], str]) -> None:
     """Record that `label` just happened and `undo_fn()` reverses it.
@@ -74,6 +93,8 @@ def push_undo(label: str, undo_fn: Callable[[], str]) -> None:
                 _stack.pop(0)
     except Exception as e:                                  # pragma: no cover
         print(f"[Undo] push failed: {e}")
+        return
+    _notify()
 
 
 def can_undo() -> bool:
@@ -105,6 +126,8 @@ def undo_last() -> str:
     if entry is None:
         return ("There is nothing to undo. I only track things I changed myself — "
                 "files I moved or wrote, and settings I adjusted.")
+
+    _notify()
 
     try:
         detail = entry.undo() or ""

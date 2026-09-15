@@ -126,35 +126,26 @@ def _ensure_network_access(port: int) -> None:
             except Exception:
                 return False
 
-        def _network_is_public() -> bool:
-            try:
-                r = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                     "(Get-NetConnectionProfile | "
-                     "Where-Object {$_.NetworkCategory -eq 'Public'} | "
-                     "Measure-Object).Count"],
-                    capture_output=True, text=True, timeout=6,
-                )
-                return r.stdout.strip() not in ("", "0")
-            except Exception:
-                return False
-
+        # NOTE: this used to also silently flip the active network profile
+        # from Public to Private when it detected one, reasoning that Windows
+        # Firewall is stricter on Public profiles. That was a bad trade: a
+        # `netsh advfirewall` rule with no `profile=` qualifier — which is
+        # exactly what's added below — already applies to Domain, Private
+        # AND Public alike, so the flip bought this dashboard nothing. What
+        # it did do is weaken every OTHER Public-profile default (network
+        # discovery, file/printer sharing become more permissive) on
+        # whatever network the PC happens to be on — a coffee-shop Wi-Fi
+        # included — for the entire session, not just while JARVIS runs.
+        # Opening one scoped port rule is enough; the profile is the user's
+        # to change, not this app's.
         need_port    = not _netsh_rule_exists(port_rule)
         need_prog    = not _netsh_rule_exists(prog_rule)
-        need_private = _network_is_public()
 
-        if not need_port and not need_prog and not need_private:
+        if not need_port and not need_prog:
             return  # already fully configured
 
-        # Build a .bat file — netsh + powershell, runs fast when elevated
+        # Build a .bat file — netsh, runs fast when elevated
         bat_lines = ["@echo off"]
-        if need_private:
-            bat_lines.append(
-                'powershell -NoProfile -NonInteractive -Command "'
-                'Get-NetConnectionProfile | '
-                "Where-Object {$_.NetworkCategory -eq 'Public'} | "
-                'Set-NetConnectionProfile -NetworkCategory Private"'
-            )
         if need_port:
             bat_lines.append(
                 f'netsh advfirewall firewall add rule '
@@ -378,8 +369,12 @@ class DashboardServer:
         self._command_queue               = asyncio.Queue()
         self._wake_callback               = None
         self._connect_callback            = None
+        self._confirm_callback            = None
+        self._undo_callback               = None
+        self._suggestion_callback         = None
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
+        self._login_failures: dict[str, list[float]] = {}  # source IP → recent failed-attempt timestamps
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
@@ -394,6 +389,26 @@ class DashboardServer:
         key = ''.join(secrets.choice(_KEY_CHARS) for _ in range(6))
         self._pending_keys[key] = now + expiry_secs
         return key
+
+    # ── pairing brute-force guard ───────────────────────────────────────────
+    # The pairing key is 6 chars from a 31-char alphabet (~887M combinations)
+    # — plenty against someone retyping it off a screen, but /login and
+    # /auto-login had no limit on how many guesses a source could make before
+    # this fix, so a script on the LAN could try keys as fast as uvicorn would
+    # accept connections. This doesn't need to be clever: 5 failures per
+    # minute per source address turns an exhaustive search from minutes into
+    # centuries while never affecting a person who fat-fingers their PIN once.
+    _LOGIN_WINDOW_S  = 60
+    _LOGIN_MAX_TRIES = 5
+
+    def _login_rate_limited(self, ip: str) -> bool:
+        now  = time.time()
+        hits = [t for t in self._login_failures.get(ip, []) if now - t < self._LOGIN_WINDOW_S]
+        self._login_failures[ip] = hits
+        return len(hits) >= self._LOGIN_MAX_TRIES
+
+    def _record_login_failure(self, ip: str) -> None:
+        self._login_failures.setdefault(ip, []).append(time.time())
 
     @staticmethod
     def _ssl_enabled() -> bool:
@@ -431,6 +446,23 @@ class DashboardServer:
 
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
+
+    def set_confirm_callback(self, fn) -> None:
+        """fn(confirm_id: str, accepted: bool) -> str — routes a phone CONFIRM/
+        CANCEL tap through the exact same core.confirm.resolve() the HUD's own
+        buttons call, so behaviour (and the single-use pending slot) is
+        identical regardless of which surface acted on it."""
+        self._confirm_callback = fn
+
+    def set_undo_callback(self, fn) -> None:
+        """fn() -> str — the same core.undo.undo_last() the HUD's UNDO
+        control calls."""
+        self._undo_callback = fn
+
+    def set_suggestion_callback(self, fn) -> None:
+        """fn(accepted: bool) -> None — the same JarvisLive._on_suggestion_decision
+        the HUD's suggestion card's ACCEPT/DISMISS buttons call."""
+        self._suggestion_callback = fn
 
     # ── broadcast ────────────────────────────────────────────────────────
 
@@ -480,6 +512,12 @@ class DashboardServer:
 
         @app.post("/login")
         async def login(req: Request):
+            ip = req.client.host if req.client else "unknown"
+            if self._login_rate_limited(ip):
+                return JSONResponse(
+                    {"ok": False, "error": "Too many attempts — wait a minute and try again"},
+                    status_code=429,
+                )
             body    = await req.json()
             entered = str(body.get("pin", "")).strip().upper()
             now     = time.time()
@@ -496,14 +534,28 @@ class DashboardServer:
                 ))
                 # Bearer token in response body — no cookies needed (works on any browser/HTTP)
                 return JSONResponse({"ok": True, "token": tok})
+            self._record_login_failure(ip)
             return JSONResponse({"ok": False, "error": "Invalid or expired key"},
                                 status_code=401)
 
         @app.get("/auto-login")
-        async def auto_login(key: str = ""):
+        async def auto_login(req: Request, key: str = ""):
             """QR code target — validates one-time key, creates session, redirects phone."""
+            ip = req.client.host if req.client else "unknown"
+            if self._login_rate_limited(ip):
+                return HTMLResponse("""<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
+<style>
+  body{background:#07090f;color:#dde3ed;font-family:sans-serif;
+       display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}
+  h2{color:#f87171;margin-bottom:12px}p{color:#5e6a7e;font-size:14px}
+</style></head>
+<body><div><h2>Too Many Attempts</h2>
+<p>Wait a minute, then press <strong style="color:#dde3ed">Remote Control</strong> in JARVIS for a new QR code.</p>
+</div></body></html>""", status_code=429)
             now = time.time()
             if not key or key not in self._pending_keys or self._pending_keys[key] <= now:
+                self._record_login_failure(ip)
                 return HTMLResponse("""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
 <style>
@@ -603,6 +655,57 @@ class DashboardServer:
             if self._wake_callback:
                 self._wake_callback()
             return JSONResponse({"ok": True})
+
+        @app.post("/api/confirm")
+        async def confirm_ep(req: Request):
+            """Resolve the one pending confirmation — single-use because
+            core.confirm's pending slot is single-use: if the HUD already
+            resolved it (or it timed out), core.confirm.pending_info() no
+            longer matches `id` and this is refused instead of double-firing
+            an irreversible action."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body = await req.json()
+            confirm_id = str(body.get("id") or "")
+            accept     = bool(body.get("accept"))
+            if not self._confirm_callback:
+                return JSONResponse({"error": "Confirmation gate unavailable"}, status_code=503)
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, self._confirm_callback, confirm_id, accept)
+            return JSONResponse({"ok": result is not False, "message": result if isinstance(result, str) else ""})
+
+        @app.post("/api/undo")
+        async def undo_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            if not self._undo_callback:
+                return JSONResponse({"error": "Undo unavailable"}, status_code=503)
+            result = await asyncio.get_event_loop().run_in_executor(None, self._undo_callback)
+            return JSONResponse({"ok": True, "message": result})
+
+        @app.post("/api/suggestion")
+        async def suggestion_ep(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            body = await req.json()
+            accept = bool(body.get("accept"))
+            if not self._suggestion_callback:
+                return JSONResponse({"error": "Suggestions unavailable"}, status_code=503)
+            await asyncio.get_event_loop().run_in_executor(None, self._suggestion_callback, accept)
+            return JSONResponse({"ok": True})
+
+        @app.get("/api/stats")
+        async def stats(req: Request, days: int = 7):
+            """Same core.telemetry.summary() data the HUD's PERFORMANCE
+            settings section shows, for the phone. Read-only, so a GET behind
+            the same auth as every other endpoint here."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            from core import telemetry
+            try:
+                return JSONResponse(telemetry.summary(days=max(1, days)))
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=500)
 
         # ── Arc Sentinel widget launcher ─────────────────────────────────────
         # The dashboard runs on the same machine as JARVIS (phone/browser is
@@ -784,6 +887,7 @@ class DashboardServer:
         asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
+            log_config=None,
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
         )
         print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
@@ -806,8 +910,12 @@ class DashboardServer:
         if use_ssl:
             asyncio.create_task(self._serve_alias())
 
+        # log_config=None: uvicorn's default config replaces the whole logging
+        # setup for the process, and its formatter probes sys.stdout. A guest
+        # server inside someone else's app has no business doing either.
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT, log_level="warning",
+            log_config=None,
             **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
         )
 
