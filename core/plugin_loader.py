@@ -12,6 +12,7 @@ import importlib.util
 import inspect
 import re
 import sys
+import threading
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,12 @@ class PluginRegistry:
         self._plugins = plugins          # name -> PluginRecord, VALID entries only
         self._all_records: list[PluginRecord] = []   # valid + invalid, for UI listing
         self._logger = logger
+        self._lock = threading.Lock()
+        # Set by discover_plugins() right after construction — needed by
+        # reload()/reload_all() to re-scan the same directory and re-apply the
+        # same collision rules a fresh discover_plugins() call would use.
+        self._plugins_dir: Optional[Path] = None
+        self._core_tool_names: set[str] = set()
 
     # -- called by main.py at LiveConnectConfig build time --
     def get_tool_declarations(self) -> list[dict]:
@@ -109,6 +116,85 @@ class PluginRegistry:
                 "enabled": get_plugin_enabled(rec.name) if rec.valid else False,
             })
         return out
+
+    # -- called by core/skill_watcher.py on a detected file change, and by
+    # the "RELOAD ALL" button in ui.py's Plugin Manager (via reload_all) --
+    def reload(self, path: Path) -> tuple[bool, str]:
+        """Re-imports a single plugin file after a change on disk. On import
+        or validation failure the previous version stays registered and
+        (False, message) is returned — a bad edit never takes a working
+        plugin down. Deleting the file unregisters its tool. Returns
+        (True, message) only when the registered tool set actually changed,
+        so callers know whether declarations need to be republished."""
+        with self._lock:
+            old_rec = next((r for r in self._all_records if r.file == path.name), None)
+            old_name = old_rec.name if old_rec and old_rec.valid else None
+
+            if not path.exists():
+                if old_name and old_name in self._plugins:
+                    del self._plugins[old_name]
+                self._all_records = [r for r in self._all_records if r.file != path.name]
+                if old_name:
+                    self._logger(f"Plugin removed: {old_name} ({path.name})")
+                return (bool(old_name), f"{old_name or path.name} removed")
+
+            module_name = f"plugins.{path.stem}"
+            try:
+                # Always a fresh spec (not importlib.reload): reload() would
+                # need "plugins" registered in sys.modules as a real package
+                # whose __path__ resolves this file, which isn't guaranteed
+                # (e.g. under test, or if nothing else ever imported the
+                # plugins package). A fresh module object is swapped into
+                # sys.modules and into the registry atomically either way.
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                if spec is None or spec.loader is None:
+                    raise ImportError("could not build import spec")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            except Exception as e:
+                msg = f"{path.name} failed to reload: {e} — previous version kept."
+                self._logger(f"Plugin reload failed: {msg}")
+                return (False, msg)
+
+            rec = _validate(module, path.name)
+            if rec.valid and rec.name in self._core_tool_names:
+                rec = PluginRecord(name=rec.name, file=path.name,
+                                    error=f"Name '{rec.name}' collides with a core tool — rejected.")
+            elif (rec.valid and rec.name in self._plugins
+                  and self._plugins[rec.name].file != path.name):
+                other = self._plugins[rec.name].file
+                rec = PluginRecord(name=rec.name, file=path.name,
+                                    error=f"Name '{rec.name}' already used by plugin '{other}' — rejected.")
+
+            if not rec.valid:
+                msg = f"{path.name} failed to reload: {rec.error} — previous version kept."
+                self._logger(f"Plugin reload failed: {msg}")
+                return (False, msg)
+
+            if old_name and old_name != rec.name and old_name in self._plugins:
+                del self._plugins[old_name]
+            self._plugins[rec.name] = rec
+            self._all_records = [r for r in self._all_records if r.file != path.name] + [rec]
+            self._logger(f"Plugin reloaded: {rec.name} ({path.name})")
+            return (True, f"Reloaded {rec.name}")
+
+    def reload_all(self) -> list[tuple[str, bool, str]]:
+        """Rescans self._plugins_dir and reloads every file found (plus drops
+        any registered file no longer on disk). Used by the manual RELOAD ALL
+        button — unlike the file-watcher, it doesn't care whether a file's
+        mtime actually changed."""
+        if self._plugins_dir is None:
+            return []
+        on_disk = {p.name: p for p in sorted(self._plugins_dir.glob("*.py"))
+                   if not p.name.startswith("_")}
+        known = {r.file for r in self._all_records}
+        results = []
+        for name, path in on_disk.items():
+            results.append((name, *self.reload(path)))
+        for name in known - set(on_disk.keys()):
+            results.append((name, *self.reload(self._plugins_dir / name)))
+        return results
 
 
 def _call_run(run_fn, parameters, player, session_memory):
@@ -216,6 +302,8 @@ def discover_plugins(plugins_dir: Path, core_tool_names: set[str],
 
     registry = PluginRegistry(valid, logger)
     registry._all_records = all_records
+    registry._plugins_dir = plugins_dir
+    registry._core_tool_names = set(core_tool_names)
     logger(f"Plugin discovery complete: {len(valid)} active, "
            f"{len(all_records) - len(valid)} rejected, {len(all_records)} total.")
     return registry
