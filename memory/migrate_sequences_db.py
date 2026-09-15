@@ -1,6 +1,12 @@
 """
 memory/migrate_sequences_db.py — one-shot / idempotent migration for the
-multi-step action sequence store (memory/sequences.db).
+sequence ("macro") store (memory/sequences.db).
+
+Adds the "confirm" column to sequence_steps (record mode re-gates a replayed
+step that originally required a confirm token — see core/sequence_memory.py's
+RECORD MODE docstring) for any database created before that column existed.
+ensure_schema() itself is idempotent, so running this against an already
+up-to-date or brand-new database is a no-op either way.
 
 Usage:
     python memory/migrate_sequences_db.py
