@@ -70,6 +70,56 @@ _IMG_MAX_H = 720
 _JPEG_Q    = 82
 
 
+def _get_api_key() -> str:
+    return _load_config().get("gemini_api_key", "")
+
+
+def _vision_query(image_bytes: bytes, mime_type: str, prompt: str) -> str:
+    """One-shot Gemini vision call: image + text prompt in, text out.
+
+    Shared by any action that needs a single structured read of an image
+    (study notes, screen_find, etc.) instead of the live multimodal session,
+    so there is one place that builds the genai client and sends the image.
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        raise RuntimeError("No Gemini API key configured.")
+
+    from google import genai
+    from google.genai import types as gtypes
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=[
+            gtypes.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            prompt,
+        ],
+    )
+    return (response.text or "").strip()
+
+
+def _text_query(prompt: str) -> str:
+    """One-shot Gemini text call: prompt in, text out — no image.
+
+    Same client/model as _vision_query, for actions that need a single
+    structured text transform (e.g. turning saved notes into quiz
+    questions) rather than reading an image.
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        raise RuntimeError("No Gemini API key configured.")
+
+    from google import genai
+
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model="gemini-flash-lite-latest",
+        contents=[prompt],
+    )
+    return (response.text or "").strip()
+
+
 def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]:
     if not _PIL:
         return img_bytes, f"image/{source_format.lower()}"
