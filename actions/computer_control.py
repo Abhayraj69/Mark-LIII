@@ -154,10 +154,30 @@ def _user_profile() -> dict:
         pass
     return {}
 
+def _type_into_focus(text: str, interval: float = 0.03) -> str:
+    """Types `text` into whatever has keyboard focus. pyautogui.typewrite()
+    only knows a fixed ASCII+control-key table and raises KeyError on
+    anything outside it — accented letters, curly quotes, em dashes, emoji —
+    which shows up constantly in natural, LLM-composed text. Route those
+    through the clipboard instead, which any target app already handles for
+    whatever Unicode it itself supports."""
+    if text.isascii():
+        pyautogui.typewrite(text, interval=interval)
+        return "typed"
+    if _PYPERCLIP:
+        pyperclip.copy(text)
+        time.sleep(0.1)
+        paste_key = "command" if _get_os() == "mac" else "ctrl"
+        pyautogui.hotkey(paste_key, "v")
+        return "pasted"
+    pyautogui.typewrite(text.encode("ascii", "ignore").decode("ascii"), interval=interval)
+    return "typed (ascii-only fallback, pyperclip unavailable)"
+
+
 def _type(text: str, interval: float = 0.03) -> str:
     _require_pyautogui()
     time.sleep(0.3)
-    pyautogui.typewrite(text, interval=interval)
+    _type_into_focus(text, interval=interval)
     return f"Typed: {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
@@ -167,15 +187,9 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
         _clear_field()
         time.sleep(0.1)
 
-    if len(text) > 20 and _PYPERCLIP:
-        pyperclip.copy(text)
-        time.sleep(0.1)
-        paste_key = "command" if _get_os() == "mac" else "ctrl"
-        pyautogui.hotkey(paste_key, "v")
-        return f"Smart-typed (clipboard): {text[:60]}{'…' if len(text) > 60 else ''}"
-
-    pyautogui.typewrite(text, interval=0.04)
-    return f"Smart-typed: {text[:60]}{'…' if len(text) > 60 else ''}"
+    mode = _type_into_focus(text, interval=0.04)
+    label = "clipboard" if mode == "pasted" else mode
+    return f"Smart-typed ({label}): {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:

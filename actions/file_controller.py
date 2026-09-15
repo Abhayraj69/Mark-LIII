@@ -158,9 +158,20 @@ def _resolve_path(raw: str) -> Path:
         "videos":    _get_videos(),
         "home":      Path.home(),
     }
-    lower = raw.strip().lower()
+    raw   = raw.strip()
+    lower = raw.lower()
     if lower in shortcuts:
         return shortcuts[lower]
+
+    # A compound path like "desktop/JarvisNotes" isn't a bare shortcut, but
+    # its first segment is — resolve that segment through the shortcut table
+    # and join the rest, instead of falling through to a path relative to
+    # the current working directory (which "desktop/JarvisNotes" would
+    # otherwise silently become).
+    head, sep, rest = raw.replace("\\", "/").partition("/")
+    if sep and head.lower() in shortcuts:
+        return shortcuts[head.lower()] / rest
+
     return Path(raw).expanduser()
 
 def _format_size(b: int) -> str:
