@@ -17,18 +17,15 @@ Supports two backends — selected via  "llm_provider"  in config/api_keys.json:
         supports function/tool calls (e.g. Qwen2.5, Llama-3.1, Mistral).
 """
 import json
-import re
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Generator
 
 import requests
 
-# Matches a sentence boundary: [.!?] followed by whitespace, or a blank line.
-# Avoids splitting on decimals (3.5) because those have no space after the dot.
-_SENT_END = re.compile(r'(?<=[.!?])\s+|(?<=\n)\s*\n')
 
 def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -400,153 +397,59 @@ def call_llm_text(
         raise RuntimeError(f"LLM text call failed: {e}")
 
 
-def _stream_openai(
-    messages: list,
-    tools:    list | None,
-    timeout:  int,
+def stream_llm(
+    messages:     list,
+    tools:        list | None = None,
+    timeout:      int = 120,
+    cancel_event: "threading.Event | None" = None,
 ) -> Generator[dict, None, None]:
     """
-    Streaming backend for OpenAI-compatible servers (LM Studio, LocalAI, Jan…).
+    Low-level streaming chat request.  Routes to Ollama or OpenAI-compatible
+    backend and yields raw wire events as they arrive:
 
-    Parses Server-Sent Events (SSE) and accumulates streaming tool-call fragments
-    so the output format is identical to the Ollama backend.
-    """
-    url, model = get_llm_settings()
-    endpoint   = f"{url}/v1/chat/completions"
+        {"delta": str}          — a fragment of assistant text
+        {"tool_call": {...}}    — one fully-assembled tool call, Ollama-shaped:
+                                   {"id": str, "function": {"name": str, "arguments": dict}}
+        {"done": {...}}         — stream finished; value is whatever token/eval
+                                   usage counters the backend reported (may be {})
 
-    payload: dict = {
-        "model":      model,
-        "messages":   messages,
-        "stream":     True,
-        "max_tokens": 150,
-    }
-    if tools:
-        payload["tools"]       = tools
-        payload["tool_choice"] = "auto"
+    This is deliberately dumb — it does not buffer into sentences or a single
+    combined reply (see core.sentence_chunker for that) and does not run the
+    tool-calling loop (see main.JarvisLive._run_local_loop). It only hides the
+    wire-format difference between Ollama's NDJSON and OpenAI's SSE, including
+    reassembling OpenAI's tool-call arguments, which arrive chunked by index
+    across many deltas, into complete calls before yielding them.
 
-    try:
-        with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
-            resp.raise_for_status()
-            full_content = ""
-            buf          = ""
-            # tool_call fragments: index → {"id", "function": {"name", "arguments"}}
-            tc_fragments: dict[int, dict] = {}
+    call_llm() remains the non-streaming entry point everything else uses;
+    this is additive, not a replacement.
 
-            for raw in resp.iter_lines():
-                if not raw:
-                    continue
-                # SSE lines look like: b"data: {...}" or b"data: [DONE]"
-                line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-
-                choice = chunk.get("choices", [{}])[0]
-                delta  = choice.get("delta", {})
-                text   = delta.get("content") or ""
-
-                full_content += text
-                buf          += text
-
-                # Accumulate sentence boundaries for streaming TTS
-                while True:
-                    m = _SENT_END.search(buf)
-                    if not m:
-                        break
-                    sentence = buf[: m.start() + 1].strip()
-                    buf      = buf[m.end():]
-                    if sentence:
-                        yield {"type": "sentence", "text": sentence}
-
-                # Accumulate streaming tool-call fragments
-                for tc in (delta.get("tool_calls") or []):
-                    idx = tc.get("index", 0)
-                    if idx not in tc_fragments:
-                        tc_fragments[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
-                    frag = tc_fragments[idx]
-                    frag["id"] = frag["id"] or tc.get("id", "")
-                    fn = tc.get("function", {})
-                    frag["function"]["name"]      += fn.get("name") or ""
-                    frag["function"]["arguments"] += fn.get("arguments") or ""
-
-                finish = choice.get("finish_reason")
-                if finish in ("stop", "tool_calls", "length"):
-                    break
-
-            # Flush any trailing content
-            if buf.strip():
-                yield {"type": "sentence", "text": buf.strip()}
-
-            # Parse accumulated tool-call argument strings → dicts
-            tool_calls: list = []
-            for idx in sorted(tc_fragments):
-                frag = tc_fragments[idx]
-                args = frag["function"]["arguments"]
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    pass   # leave as raw string; _execute_tool handles it
-                tool_calls.append({
-                    "id":       frag["id"],
-                    "function": {"name": frag["function"]["name"], "arguments": args},
-                })
-
-            yield {
-                "type":       "done",
-                "content":    full_content.strip(),
-                "tool_calls": tool_calls,
-            }
-
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError(
-            f"Cannot reach OpenAI-compatible server at {url}.\n"
-            "Make sure LM Studio / LocalAI / Jan is running and the server is started."
-        )
-    except requests.exceptions.Timeout:
-        raise RuntimeError("OpenAI-compatible stream timed out.")
-    except requests.exceptions.HTTPError as e:
-        raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
-    except Exception as e:
-        raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
-
-
-def call_llm_stream(
-    messages: list,
-    tools:    list | None = None,
-    timeout:  int = 120,
-) -> Generator[dict, None, None]:
-    """
-    Streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
-
-    Yields:
-        {"type": "sentence", "text": str}   — each complete sentence as it arrives
-        {"type": "done", "content": str, "tool_calls": list}  — when stream ends
-
-    Sentences are split on [.!?] + whitespace so TTS can start immediately.
-    Tool calls always appear in the final "done" event.
+    `cancel_event`, when given, is polled between chunks so a barge-in
+    interrupt can stop reading and let the underlying HTTP response close
+    without waiting for the model to finish generating.
     """
     provider = get_llm_provider()
     if provider == "openai":
-        yield from _stream_openai(messages, tools, timeout)
-        return
+        yield from _stream_openai_raw(messages, tools, timeout, cancel_event)
+    else:
+        yield from _stream_ollama_raw(messages, tools, timeout, cancel_event)
 
+
+def _stream_ollama_raw(
+    messages:     list,
+    tools:        list | None,
+    timeout:      int,
+    cancel_event: "threading.Event | None",
+) -> Generator[dict, None, None]:
     url, model = get_llm_settings()
     endpoint   = f"{url}/api/chat"
+    temperature, max_tokens = get_llm_tuning()
 
     payload: dict = {
         "model":      model,
         "messages":   messages,
         "stream":     True,
         "keep_alive": -1,
-        # 150 tokens ≈ 100 words ≈ 3-4 sentences — enough for any voice reply.
-        # num_gpu:99 pushes all layers to GPU; num_thread removed (Ollama auto-tunes).
-        "options":    {"num_predict": 150, "num_gpu": 99},
+        "options":    {"num_predict": max_tokens, "temperature": temperature, "num_gpu": 99},
     }
     if tools:
         payload["tools"] = tools
@@ -554,11 +457,9 @@ def call_llm_stream(
     def _do_stream() -> Generator[dict, None, None]:
         with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
             resp.raise_for_status()
-            full_content = ""
-            tool_calls:  list = []
-            buf          = ""
-
             for raw in resp.iter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    return   # exits the `with` block → closes the response
                 if not raw:
                     continue
                 try:
@@ -568,33 +469,21 @@ def call_llm_stream(
 
                 msg   = chunk.get("message", {})
                 delta = msg.get("content") or ""
+                if delta:
+                    yield {"delta": delta}
 
-                full_content += delta
-                buf          += delta
-
-                # Yield complete sentences as they accumulate
-                while True:
-                    m = _SENT_END.search(buf)
-                    if not m:
-                        break
-                    sentence = buf[: m.start() + 1].strip()
-                    buf      = buf[m.end() :]
-                    if sentence:
-                        yield {"type": "sentence", "text": sentence}
-
-                tc = msg.get("tool_calls")
-                if tc:
-                    tool_calls.extend(tc)
+                for tc in (msg.get("tool_calls") or []):
+                    fn = tc.get("function", {})
+                    yield {"tool_call": {
+                        "id":       tc.get("id", ""),
+                        "function": {"name": fn.get("name", ""), "arguments": fn.get("arguments") or {}},
+                    }}
 
                 if chunk.get("done"):
-                    if buf.strip():
-                        yield {"type": "sentence", "text": buf.strip()}
-
-                    yield {
-                        "type":       "done",
-                        "content":    full_content.strip(),
-                        "tool_calls": tool_calls,
-                    }
+                    yield {"done": {
+                        "prompt_tokens":     chunk.get("prompt_eval_count"),
+                        "completion_tokens": chunk.get("eval_count"),
+                    }}
                     return
 
     try:
@@ -615,3 +504,105 @@ def call_llm_stream(
     except Exception as e:
         print(f"[LLM] Stream error: {type(e).__name__}: {e}")
         raise RuntimeError(f"LLM stream failed: {e}")
+
+
+def _stream_openai_raw(
+    messages:     list,
+    tools:        list | None,
+    timeout:      int,
+    cancel_event: "threading.Event | None",
+) -> Generator[dict, None, None]:
+    """Parses Server-Sent Events and accumulates chunked tool-call fragments
+    (OpenAI streams tool_call name/arguments in pieces keyed by index) into
+    complete calls, yielded only once the stream signals it's done."""
+    url, model = get_llm_settings()
+    endpoint   = f"{url}/v1/chat/completions"
+    temperature, max_tokens = get_llm_tuning()
+
+    payload: dict = {
+        "model":       model,
+        "messages":    messages,
+        "stream":      True,
+        "max_tokens":  max_tokens,
+        "temperature": temperature,
+    }
+    if tools:
+        payload["tools"]       = tools
+        payload["tool_choice"] = "auto"
+
+    def _do_stream() -> Generator[dict, None, None]:
+        with requests.post(endpoint, json=payload, timeout=timeout, stream=True) as resp:
+            resp.raise_for_status()
+            # tool_call fragments: index → {"id", "function": {"name", "arguments"}}
+            tc_fragments: dict[int, dict] = {}
+            usage: dict = {}
+
+            for raw in resp.iter_lines():
+                if cancel_event is not None and cancel_event.is_set():
+                    return   # exits the `with` block → closes the response
+                if not raw:
+                    continue
+                # SSE lines look like: b"data: {...}" or b"data: [DONE]"
+                line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+
+                choice = (chunk.get("choices") or [{}])[0]
+                delta  = choice.get("delta", {})
+                text   = delta.get("content") or ""
+                if text:
+                    yield {"delta": text}
+
+                for tc in (delta.get("tool_calls") or []):
+                    idx = tc.get("index", 0)
+                    if idx not in tc_fragments:
+                        tc_fragments[idx] = {"id": "", "function": {"name": "", "arguments": ""}}
+                    frag = tc_fragments[idx]
+                    frag["id"] = frag["id"] or tc.get("id", "")
+                    fn = tc.get("function", {})
+                    frag["function"]["name"]      += fn.get("name") or ""
+                    frag["function"]["arguments"] += fn.get("arguments") or ""
+
+                finish = choice.get("finish_reason")
+                if finish in ("stop", "tool_calls", "length"):
+                    break
+
+            # Now that the stream is done, parse each fragment's accumulated
+            # argument string into a dict and yield the complete tool call.
+            for idx in sorted(tc_fragments):
+                frag = tc_fragments[idx]
+                args = frag["function"]["arguments"]
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    pass   # leave as raw string; the dispatcher handles it
+                yield {"tool_call": {
+                    "id":       frag["id"],
+                    "function": {"name": frag["function"]["name"], "arguments": args},
+                }}
+
+            yield {"done": usage}
+
+    try:
+        yield from _do_stream()
+    except requests.exceptions.ConnectionError:
+        raise RuntimeError(
+            f"Cannot reach OpenAI-compatible server at {url}.\n"
+            "Make sure LM Studio / LocalAI / Jan is running and the server is started."
+        )
+    except requests.exceptions.Timeout:
+        raise RuntimeError("OpenAI-compatible stream timed out.")
+    except requests.exceptions.HTTPError as e:
+        raise RuntimeError(f"OpenAI-compatible HTTP error: {e.response.status_code}")
+    except Exception as e:
+        raise RuntimeError(f"OpenAI-compatible stream failed: {e}")
