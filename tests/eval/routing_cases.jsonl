@@ -1,0 +1,84 @@
+{"text": "Open a new browser tab and go to github.com", "expect_tool": "browser_control", "tags": ["action"]}
+{"text": "Search Google for the best pizza place nearby", "expect_tool": "browser_control", "tags": ["action"]}
+{"text": "Why do I always get distracted after lunch?", "expect_tool": "causal_insight", "tags": ["action"]}
+{"text": "What's usually causing my focus to drop in the afternoon?", "expect_tool": "causal_insight", "tags": ["action"]}
+{"text": "Explain what this function I'm looking at does", "expect_tool": "code_helper", "tags": ["action"]}
+{"text": "Refactor this code to be more readable", "expect_tool": "code_helper", "tags": ["action"]}
+{"text": "Move the mouse cursor to the center of the screen", "expect_tool": "computer_control", "tags": ["action"]}
+{"text": "Type out the sentence: meeting at three PM tomorrow", "expect_tool": "computer_control", "tags": ["action"]}
+{"text": "Can you turn the brightness down a bit, my eyes are tired", "expect_tool": "computer_settings", "expect_args_subset": {"action": "brightness_down"}, "tags": ["action"]}
+{"text": "Could you switch my display over to dark mode please", "expect_tool": "computer_settings", "expect_args_subset": {"action": "dark_mode"}, "tags": ["action"]}
+{"text": "My desktop is a mess, can you sort those icons out for me", "expect_tool": "desktop_control", "tags": ["action"]}
+{"text": "Group all the files on my desktop by file type", "expect_tool": "desktop_control", "expect_args_subset": {"action": "organize"}, "tags": ["action"]}
+{"text": "Write a Python script that scrapes a webpage and saves the results to a CSV", "expect_tool": "dev_agent", "tags": ["action"]}
+{"text": "Build me a small Flask API with one endpoint", "expect_tool": "dev_agent", "tags": ["action"]}
+{"text": "Move my resume.pdf from Downloads to Documents", "expect_tool": "file_controller", "tags": ["action"]}
+{"text": "Rename report_draft.docx to report_final.docx", "expect_tool": "file_controller", "tags": ["action"]}
+{"text": "Summarize the contents of my notes.txt file", "expect_tool": "file_processor", "tags": ["action"]}
+{"text": "Extract all the email addresses from contacts.csv", "expect_tool": "file_processor", "tags": ["action"]}
+{"text": "Find me a flight from New York to London next Friday", "expect_tool": "flight_finder", "tags": ["action"]}
+{"text": "What are the cheapest flights to Tokyo in December", "expect_tool": "flight_finder", "tags": ["action"]}
+{"text": "Launch Spotify", "expect_tool": "open_app", "expect_args_subset": {"app_name": "spotify"}, "tags": ["action"]}
+{"text": "Open Visual Studio Code", "expect_tool": "open_app", "tags": ["action"]}
+{"text": "Remind me to call the dentist tomorrow at 9am", "expect_tool": "reminder", "tags": ["action"]}
+{"text": "Set a reminder to submit the report every Friday", "expect_tool": "reminder", "tags": ["action"]}
+{"text": "Keep an eye on my screen and alert me if anything changes in the top right corner", "expect_tool": "screen_monitor", "tags": ["action"]}
+{"text": "Start monitoring this window for updates", "expect_tool": "screen_monitor", "tags": ["action"]}
+{"text": "Send a text to Mom saying I'll be late", "expect_tool": "send_message", "tags": ["action"]}
+{"text": "Message the team on Slack that the deploy is done", "expect_tool": "send_message", "tags": ["action"]}
+{"text": "Record a macro called morning routine", "expect_tool": "manage_sequence", "tags": ["action"]}
+{"text": "Replay the sequence named end of day", "expect_tool": "manage_sequence", "tags": ["action"]}
+{"text": "Start a study session on organic chemistry", "expect_tool": "study_mode", "tags": ["action"]}
+{"text": "Enter study mode for my history exam", "expect_tool": "study_mode", "tags": ["action"]}
+{"text": "Take notes on this chapter about the French Revolution", "expect_tool": "study_notes", "tags": ["action"]}
+{"text": "Summarize my notes on cellular respiration", "expect_tool": "study_notes", "tags": ["action"]}
+{"text": "How much progress have I made studying calculus this week", "expect_tool": "study_progress", "tags": ["action"]}
+{"text": "Show me my study progress for biology", "expect_tool": "study_progress", "tags": ["action"]}
+{"text": "Quiz me on the periodic table", "expect_tool": "study_quiz", "tags": ["action"]}
+{"text": "Give me a practice test on world history", "expect_tool": "study_quiz", "tags": ["action"]}
+{"text": "What's the weather going to be like tomorrow", "expect_tool": "weather_report", "tags": ["action"]}
+{"text": "Will it rain this weekend", "expect_tool": "weather_report", "tags": ["action"]}
+{"text": "Search the web for the latest news on the stock market", "expect_tool": "web_search", "tags": ["action"]}
+{"text": "Look up how to fix a leaky faucet", "expect_tool": "web_search", "tags": ["action"]}
+{"text": "Play some lofi music on youtube", "expect_tool": "youtube_video", "tags": ["action"]}
+{"text": "Find a tutorial video on changing a tire", "expect_tool": "youtube_video", "tags": ["action"]}
+{"text": "Update all my installed games", "expect_tool": "game_updater", "tags": ["action"]}
+{"text": "Check for updates to Valorant", "expect_tool": "game_updater", "tags": ["action"]}
+{"text": "How much RAM am I using right now", "expect_tool": "system_status", "tags": ["action", "inline"]}
+{"text": "What's on my screen right now, can you describe it", "expect_tool": "screen_process", "tags": ["action", "inline"]}
+{"text": "Turn off the webcam", "expect_tool": "close_camera", "tags": ["action", "inline"]}
+{"text": "Start a background monitor that watches CPU usage and warns me if it spikes", "expect_tool": "manage_monitor", "tags": ["action", "inline"]}
+{"text": "That's all for now, go to sleep Jarvis", "expect_tool": "shutdown_jarvis", "tags": ["action", "inline"]}
+{"text": "Remember that my favorite color is blue", "expect_tool": "save_memory", "tags": ["action", "inline"]}
+{"text": "What did I tell you my favorite color was", "expect_tool": "recall_memory", "tags": ["action", "inline"]}
+{"text": "Undo that last action", "expect_tool": "undo", "tags": ["action", "inline"]}
+{"text": "volume up", "expect_tool": "computer_settings", "expect_args_subset": {"action": "volume_up"}, "tags": ["fast_intent"]}
+{"text": "volume down", "expect_tool": "computer_settings", "expect_args_subset": {"action": "volume_down"}, "tags": ["fast_intent"]}
+{"text": "mute the volume", "expect_tool": "computer_settings", "expect_args_subset": {"action": "mute"}, "tags": ["fast_intent"]}
+{"text": "brightness up", "expect_tool": "computer_settings", "expect_args_subset": {"action": "brightness_up"}, "tags": ["fast_intent"]}
+{"text": "lock the screen", "expect_tool": "computer_settings", "expect_args_subset": {"action": "lock_screen"}, "tags": ["fast_intent"]}
+{"text": "take a screenshot", "expect_tool": "computer_settings", "expect_args_subset": {"action": "screenshot"}, "tags": ["fast_intent"]}
+{"text": "open a new tab", "expect_tool": "computer_settings", "expect_args_subset": {"action": "new_tab"}, "tags": ["fast_intent"]}
+{"text": "set the volume to 50%", "expect_tool": "computer_settings", "expect_args_subset": {"action": "volume_set", "value": "50"}, "tags": ["fast_intent"]}
+{"text": "press enter", "expect_tool": "computer_settings", "expect_args_subset": {"action": "press_key", "value": "enter"}, "tags": ["fast_intent"]}
+{"text": "open notepad", "expect_tool": "open_app", "expect_args_subset": {"app_name": "notepad"}, "tags": ["fast_intent"]}
+{"text": "What's the capital of Peru", "expect_tool": null, "tags": ["prose"]}
+{"text": "How many moons does Jupiter have", "expect_tool": null, "tags": ["prose"]}
+{"text": "Explain the theory of relativity in simple terms", "expect_tool": null, "tags": ["prose"]}
+{"text": "What's the difference between a crocodile and an alligator", "expect_tool": null, "tags": ["prose"]}
+{"text": "Tell me a fun fact about octopuses", "expect_tool": null, "tags": ["prose"]}
+{"text": "Who wrote Pride and Prejudice", "expect_tool": null, "tags": ["prose"]}
+{"text": "What year did World War Two end", "expect_tool": null, "tags": ["prose"]}
+{"text": "How does photosynthesis work", "expect_tool": null, "tags": ["prose"]}
+{"text": "What's the tallest mountain in the world", "expect_tool": null, "tags": ["prose"]}
+{"text": "Give me a synonym for the word happy", "expect_tool": null, "tags": ["prose"]}
+{"text": "Open the report", "expect_tool": "file_controller", "tags": ["ambiguous"]}
+{"text": "Open Chrome", "expect_tool": "open_app", "tags": ["ambiguous"]}
+{"text": "Close it", "expect_tool": null, "tags": ["ambiguous"]}
+{"text": "Play music", "expect_tool": null, "tags": ["ambiguous"]}
+{"text": "Send it to John", "expect_tool": null, "tags": ["ambiguous"]}
+{"text": "Update it", "expect_tool": "game_updater", "tags": ["ambiguous"]}
+{"text": "Remind me about that", "expect_tool": "reminder", "tags": ["ambiguous"]}
+{"text": "Search for it", "expect_tool": null, "tags": ["ambiguous"]}
+{"text": "Delete the file", "expect_tool": "file_controller", "tags": ["ambiguous"]}
+{"text": "Open settings", "expect_tool": "computer_settings", "expect_args_subset": {"action": "open_settings"}, "tags": ["ambiguous"]}

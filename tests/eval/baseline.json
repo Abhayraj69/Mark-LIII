@@ -1,0 +1,16 @@
+{
+  "generated_at": "2026-09-15T22:22:50",
+  "corpus_size": 84,
+  "backends": {
+    "fast_intent": {
+      "accuracy": 0.32142857142857145,
+      "total": 84,
+      "correct": 27
+    },
+    "ollama": {
+      "accuracy": 0.19047619047619047,
+      "total": 84,
+      "correct": 16
+    }
+  }
+}
