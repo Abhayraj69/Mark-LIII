@@ -5,6 +5,8 @@ import re
 import time
 from pathlib import Path
 
+from core.backend_router import TaskKind, get_text_model, load_policy_from_config
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -15,7 +17,6 @@ BASE_DIR           = get_base_dir()
 API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
-GEMINI_MODEL       = "gemini-flash-latest"
 
 
 def _get_api_key() -> str:
@@ -23,15 +24,16 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _get_gemini(model: str = GEMINI_MODEL):
-    from google import genai
-    _c = genai.Client(api_key=_get_api_key())
-
-    class _W:
-        def generate_content(self, contents):
-            return _c.models.generate_content(model=model, contents=contents)
-
-    return _W()
+def _get_gemini(kind=TaskKind.CODE_GEN):
+    # Routed through core/backend_router.py (ROUTING settings section) so
+    # write/edit/explain/optimize try claude, then ollama, then gemini —
+    # with per-backend failover — instead of a hand-rolled claude-or-gemini
+    # switch. screen_debug is unaffected — it calls genai.Client directly
+    # for the image-input path, which none of the text-only backends here
+    # can stand in for.
+    from memory.config_manager import get_plugin_config
+    policy = load_policy_from_config(get_plugin_config("routing"))
+    return get_text_model(kind, policy=policy)
 
 
 def _clean_code(text: str) -> str:
@@ -145,7 +147,7 @@ def _detect_intent(description: str, file_path: str, code: str) -> str:
                 "  optimize     = refactor / clean up / speed up existing code\n\n"
                 "Reply with ONLY the intent word, nothing else."
             )
-            ans = _get_gemini().generate_content(prompt).text.strip().lower()
+            ans = _get_gemini(TaskKind.INTENT).generate_content(prompt).text.strip().lower()
             ans = ans.strip("`'\". \n")
             if ans in _VALID_INTENTS:
                 return ans
@@ -352,7 +354,7 @@ def _explain_action(file_path, code, player) -> str:
     if player:
         player.write_log("[Code] Analyzing code...")
 
-    model  = _get_gemini()
+    model  = _get_gemini(TaskKind.CODE_REVIEW)
     prompt = f"""Explain what this code does in simple, clear language.
 Focus on: what it does, how it works, and any important details.
 Be concise — 3 to 6 sentences maximum.

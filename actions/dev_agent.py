@@ -5,6 +5,8 @@ import re
 import time
 from pathlib import Path
 
+from core.backend_router import TaskKind
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -13,26 +15,19 @@ def get_base_dir():
 
 
 BASE_DIR         = get_base_dir()
-API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
-MODEL_PLANNER    = "gemini-flash-latest"
-MODEL_WRITER     = "gemini-flash-latest"
-
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
 
 
-def _get_model(model_name: str):
-    from google import genai
-    _c = genai.Client(api_key=_get_api_key())
-
-    class _W:
-        def generate_content(self, contents):
-            return _c.models.generate_content(model=model_name, contents=contents)
-
-    return _W()
+def _get_model(kind=None):
+    # Routed through core/backend_router.py (ROUTING settings section) so
+    # planning/writing/fixing tries claude, then ollama, then gemini — with
+    # per-backend failover — instead of a hand-rolled claude-or-gemini
+    # switch. Same .generate_content(prompt).text shape either way.
+    from core.backend_router import TaskKind, get_text_model, load_policy_from_config
+    from memory.config_manager import get_plugin_config
+    policy = load_policy_from_config(get_plugin_config("routing"))
+    return get_text_model(kind or TaskKind.CODE_GEN, policy=policy)
 
 
 def _strip_fences(text: str) -> str:
@@ -102,7 +97,7 @@ class RateLimitError(Exception):
 
 
 def _plan_project(description: str, language: str) -> dict:
-    model = _get_model(MODEL_PLANNER)
+    model = _get_model(TaskKind.CODE_GEN)
 
     prompt = f"""You are a senior software architect. Create a minimal, complete file plan for this project.
 
@@ -158,7 +153,7 @@ def _write_file(
     project_dir: Path,
     already_written: dict[str, str],
 ) -> str:
-    model = _get_model(MODEL_WRITER)
+    model = _get_model(TaskKind.CODE_GEN)
 
     file_path = file_info["path"]
     file_desc = file_info.get("description", "")
@@ -355,7 +350,7 @@ def _fix_files(
     entry_point: str,
 ) -> dict[str, str]:
 
-    model = _get_model(MODEL_PLANNER)
+    model = _get_model(TaskKind.CODE_GEN)
 
     error_file, error_line = _parse_traceback(error_output, list(file_codes.keys()))
     error_type = _classify_error(error_output)

@@ -1,14 +1,18 @@
 """
 Converts Gemini's function-declaration schema — the shape used everywhere
 else in this codebase (main.py's TOOL_DECLARATIONS, ActionRegistry and
-PluginRegistry's get_tool_declarations()) — into the OpenAI-style `tools`
-array that Ollama's /api/chat and any OpenAI-compatible server expect for
-tool-calling.
+PluginRegistry's get_tool_declarations()) — into the wire format each
+tool-calling backend expects:
 
-Local Mode (main.py: JarvisLive._run_local_loop) dispatches against the exact
-same tool registry Gemini Live uses; only the wire format the model sees
-differs, so this is a pure format translation with no behavioural logic of
-its own.
+  gemini_tools_to_openai()    → OpenAI-style `tools` array (Ollama's
+                                 /api/chat, any OpenAI-compatible server).
+  gemini_tools_to_anthropic() → Anthropic Messages API `tools` array
+                                 (core/claude_bridge.py).
+
+Local Mode (main.py: JarvisLive._run_local_loop) and the Claude bridge both
+dispatch against the exact same tool registry Gemini Live uses; only the wire
+format the model sees differs, so this is a pure format translation with no
+behavioural logic of its own.
 """
 from __future__ import annotations
 
@@ -54,5 +58,26 @@ def gemini_tools_to_openai(tools: list[dict]) -> list[dict]:
                     t.get("parameters") or {"type": "object", "properties": {}}
                 ),
             },
+        })
+    return out
+
+
+def gemini_tools_to_anthropic(tools: list[dict]) -> list[dict]:
+    """`tools` is the same list shape passed into Gemini's
+    `function_declarations` — main.py's TOOL_DECLARATIONS plus whatever
+    ActionRegistry / PluginRegistry .get_tool_declarations() return. Returns
+    the equivalent Anthropic Messages API `tools=[...]` array — Anthropic
+    wants each entry flat, as {"name", "description", "input_schema"}, with
+    no wrapper object (unlike OpenAI's nested "function" key above)."""
+    out = []
+    for t in tools or []:
+        if not isinstance(t, dict) or not t.get("name"):
+            continue
+        out.append({
+            "name":        t["name"],
+            "description": t.get("description", ""),
+            "input_schema": _convert_schema(
+                t.get("parameters") or {"type": "object", "properties": {}}
+            ),
         })
     return out

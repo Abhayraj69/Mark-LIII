@@ -32,6 +32,11 @@ def _get_api_key() -> str:
 
 
 def _gemini_client():
+    # Image (describe/ocr/analyze) and audio (transcribe) calls stay on
+    # Gemini directly — they pass a PIL Image or raw audio bytes straight
+    # into generate_content(), which core/backend_router.py's adapters don't
+    # accept (its `images` param is (bytes, mime) tuples for inline_data,
+    # and it has no audio path at all).
     from google import genai
     _c = genai.Client(api_key=_get_api_key())
 
@@ -40,6 +45,17 @@ def _gemini_client():
             return _c.models.generate_content(model="gemini-flash-latest", contents=contents)
 
     return _W()
+
+
+def _text_model():
+    # Routed through core/backend_router.py (ROUTING settings section) for
+    # every plain-text summarize/analyze call below — tries claude, then
+    # ollama, then gemini, with per-backend failover — instead of always
+    # paying for Gemini even when a cheaper/local backend would do.
+    from core.backend_router import TaskKind, get_text_model, load_policy_from_config
+    from memory.config_manager import get_plugin_config
+    policy = load_policy_from_config(get_plugin_config("routing"))
+    return get_text_model(TaskKind.SUMMARIZE, policy=policy)
 
 
 def _detect_type(path: Path) -> str:
@@ -210,7 +226,7 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             "reformat":       f"Reformat this text cleanly with proper structure:\n\n{text}",
         }
         try:
-            model    = _gemini_client()
+            model    = _text_model()
             response = model.generate_content(prompt_map.get(action, f"Analyze:\n\n{text}"))
             result   = response.text.strip()
             if len(result) > 600 and params.get("save", True):
@@ -300,7 +316,7 @@ def _process_text_doc(path: Path, file_type: str, action: str,
         instruction = action
 
     try:
-        model    = _gemini_client()
+        model    = _text_model()
         response = model.generate_content(prompt_map[action])
         result   = response.text.strip()
         if len(result) > 600 and params.get("save", True):
@@ -347,7 +363,7 @@ def _process_data(path: Path, file_type: str, action: str,
                    f"Rows: {len(df)}\nPreview:\n{preview}\n\n"
                    f"Give insights, patterns, and notable findings.")
         try:
-            model    = _gemini_client()
+            model    = _text_model()
             response = model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
@@ -401,7 +417,7 @@ def _process_data(path: Path, file_type: str, action: str,
 
     preview = df.head(30).to_string()
     try:
-        model    = _gemini_client()
+        model    = _text_model()
         response = model.generate_content(
             f"Task: {action}\nDataset ({len(df)} rows, cols: {list(df.columns)}):\n{preview}"
         )
@@ -432,7 +448,7 @@ def _process_json(path: Path, action: str, params: dict, speak=None) -> str:
         if params.get("instruction"):
             prompt = f"{params['instruction']}\n\nJSON data:\n{preview}"
         try:
-            model    = _gemini_client()
+            model    = _text_model()
             response = model.generate_content(prompt)
             return response.text.strip()
         except Exception as e:
@@ -496,7 +512,7 @@ def _process_code(path: Path, action: str, params: dict, speak=None) -> str:
         prompt = prompt_map[action]
 
     try:
-        model    = _gemini_client()
+        model    = _text_model()
         response = model.generate_content(prompt)
         result   = response.text.strip()
 
@@ -767,7 +783,7 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
             out.write_text(text, encoding="utf-8")
             return f"Text extracted. Saved: {out.name}"
         try:
-            model    = _gemini_client()
+            model    = _text_model()
             prompt   = f"{'Summarize' if action == 'summarize' else 'Analyze'} this presentation:\n{text[:30000]}"
             response = model.generate_content(prompt)
             return response.text.strip()
@@ -800,7 +816,7 @@ def file_processor(parameters: dict, player=None, speak=None) -> str:
     if file_type == "unknown":
         try:
             content = path.read_text(encoding="utf-8", errors="ignore")[:10000]
-            model   = _gemini_client()
+            model   = _text_model()
             prompt  = f"File: {path.name}\nContent preview:\n{content}\n\nTask: {action or instruction or 'Describe what this file contains and what can be done with it.'}"
             response = model.generate_content(prompt)
             return response.text.strip()
