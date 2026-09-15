@@ -123,7 +123,21 @@ class WakeWordDetector:
 
     def start(self) -> bool:
         """Load the model and spawn the inference thread. Returns True on success.
-        Safe to call again — a no-op if already running. Never raises."""
+        Safe to call again — a no-op if already running. Never raises.
+
+        Note for repeat listening sessions (e.g. main.py re-arming this same
+        detector every time the user says "bye jarvis"): this only loads the
+        model once — it does NOT reset its internal buffers on a later call.
+        openwakeword's Model keeps a rolling mel-spectrogram/embedding window
+        across predict() calls, updated only while frames are actually being
+        fed. If it stops being fed mid-phrase (exactly what happens here: the
+        last frames it ever saw before a wake are the "hey jarvis" that
+        triggered it) and is left untouched for a while, that window stays
+        frozen holding that stale phrase. Feed it again later without
+        clearing it first, and a handful of fresh frames layered on top of
+        that stale window can immediately score as another match — a false
+        wake within about a second of resuming, with no new "Hey Jarvis"
+        actually said. Call reset() before resuming feed() to avoid this."""
         if self._running:
             return True
         try:
@@ -139,6 +153,19 @@ class WakeWordDetector:
         self._thread.start()
         self._logger("Wake word: listening for 'Hey Jarvis'.")
         return True
+
+    def reset(self) -> None:
+        """Clear the model's internal audio/embedding buffers before a fresh
+        listening session (see WakeWordDetector.start()'s docstring for why
+        this matters here). Safe to call any time the detector isn't
+        mid-predict() — true whenever nothing has called feed() since the
+        last detection, which is exactly how the caller in main.py uses it
+        (right as it re-arms the detector, before any new audio is fed)."""
+        if self._model is not None:
+            try:
+                self._model.reset()
+            except Exception as e:
+                self._logger(f"Wake word: reset failed — {e}")
 
     def stop(self) -> None:
         self._running = False

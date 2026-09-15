@@ -12,11 +12,18 @@
     look of the main JARVIS HUD; --accent is overridden at load time from the
     daemon's ?accent= query param so it tracks whatever colour the user set
     in JARVIS's own Customise panel instead of a fixed blue.
+
+    The card is a frosted-glass panel rather than a flat fill: .widget sits a
+    hair inset from the window edge with rounded corners and a translucent
+    background blurred over a moody two-tone body backdrop, so the corners
+    read as a floating card instead of a hard rectangle — without requiring
+    real OS-level window transparency (finicky across WebView2 versions and
+    not worth the risk for a small utility widget).
   */
-  @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
 
   :root{
-    --bg:        #070c16;
+    --bg:        #05070d;
     --bg-panel:  #0c1626;
     --bg-panel2: #0a1220;
     --line:      #1c2e47;
@@ -41,7 +48,13 @@
   html, body{ width: 100%; height: 100%; margin: 0; }
 
   body{
-    background: var(--bg);
+    /* Two soft off-axis colour blooms behind the glass card — with nothing
+       textured back here, backdrop-filter would just blur a flat fill and
+       the "frosted glass" effect would be invisible. */
+    background:
+      radial-gradient(60% 50% at 14% 8%,  var(--accent-soft) 0%, transparent 60%),
+      radial-gradient(55% 45% at 90% 96%, var(--accent-soft) 0%, transparent 62%),
+      var(--bg);
     color: var(--text);
     font-family: var(--font-display);
     display: flex;
@@ -56,14 +69,19 @@
     position: relative;
     width: 100%;
     height: 100%;
-    /* Two stacked gradients rather than color-mix() (unsupported on older
-       WebView2 runtimes): an accent-tinted glow layered over the same
-       neutral panel gradient the rest of the widget uses. */
+    border-radius: 20px;
+    overflow: hidden;
+    /* Frosted glass: a translucent, blurred panel over the body's colour
+       blooms, not a flat opaque fill. */
     background:
       radial-gradient(120% 140% at 50% -10%, var(--accent-soft) 0%, transparent 46%),
-      radial-gradient(120% 140% at 50% -10%, #101d33 0%, var(--bg-panel) 46%, var(--bg-panel2) 100%);
-    border: 1px solid var(--line);
-    padding: 16px 20px 18px;
+      linear-gradient(180deg, rgba(14,22,38,.62) 0%, rgba(7,12,22,.68) 100%);
+    backdrop-filter: blur(18px) saturate(150%);
+    -webkit-backdrop-filter: blur(18px) saturate(150%);
+    border: 1px solid rgba(255,255,255,.08);
+    box-shadow: 0 0 0 1px rgba(0,0,0,.4), 0 18px 40px -14px rgba(0,0,0,.6),
+                inset 0 1px 0 rgba(255,255,255,.06);
+    padding: 14px 16px 16px;
     display: flex;
     flex-direction: column;
   }
@@ -76,17 +94,32 @@
     font-size: 10px;
     letter-spacing: .1em;
     color: var(--text-faint);
-    margin-bottom: 12px;
+    margin-bottom: 10px;
     -webkit-app-region: drag;
   }
-  .eyebrow .id{ display:flex; align-items:center; gap:6px; }
+  .eyebrow .id{ display:flex; align-items:center; gap:7px; color: var(--text); text-shadow: 0 0 8px var(--accent-soft); }
   .eyebrow .dot{
+    position: relative;
     width: 6px; height: 6px; border-radius: 50%;
     background: var(--accent);
-    box-shadow: 0 0 8px 1px var(--accent-soft);
+    box-shadow: 0 0 8px 2px var(--accent-soft);
     animation: dotpulse 1.8s ease-in-out infinite;
   }
+  .eyebrow .dot::after{
+    content:''; position:absolute; inset:-5px; border-radius:50%;
+    background: radial-gradient(circle, var(--accent-soft) 0%, transparent 70%);
+  }
   @keyframes dotpulse{ 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* Awake/sleeping colour cue on the eyebrow — same fixed green/red tokens
+     the mic button already uses for its own on/off state, so this reads as
+     the same semantic language rather than a one-off colour choice. */
+  #sentinelState.state-awake{ color: var(--green); text-shadow: 0 0 8px rgba(0,255,136,.5); }
+  #sentinelState.state-sleeping{ color: var(--red); text-shadow: 0 0 8px rgba(255,51,85,.5); }
+  #sentinelDot.state-awake{ background: var(--green); box-shadow: 0 0 8px 2px rgba(0,255,136,.5); }
+  #sentinelDot.state-sleeping{ background: var(--red); box-shadow: 0 0 8px 2px rgba(255,51,85,.5); }
+  #sentinelDot.state-awake::after{ background: radial-gradient(circle, rgba(0,255,136,.35) 0%, transparent 70%); }
+  #sentinelDot.state-sleeping::after{ background: radial-gradient(circle, rgba(255,51,85,.35) 0%, transparent 70%); }
 
   .close-btn{
     -webkit-app-region: no-drag;
@@ -96,28 +129,83 @@
   }
   .close-btn:hover{ color: var(--red); }
 
+  /* Drag-to-resize grip, top-left corner. The window is anchored to the
+     screen's bottom-right (see wake_widget_daemon.py), so resizing pivots
+     from that fixed corner — dragging this handle up/left grows the widget,
+     down/right shrinks it, exactly like resizing a normal window from its
+     top-left edge. -webkit-app-region: no-drag keeps it from being swallowed
+     by the eyebrow's window-drag region, even though it visually overlaps it. */
+  .resize-handle{
+    position: absolute; top: 0; left: 0; width: 18px; height: 18px;
+    cursor: nwse-resize;
+    -webkit-app-region: no-drag;
+    z-index: 5;
+  }
+  .resize-handle::before{
+    content: ''; position: absolute; top: 6px; left: 6px; width: 8px; height: 8px;
+    border-left: 2px solid var(--text-faint); border-top: 2px solid var(--text-faint);
+    opacity: .55;
+    transition: opacity .15s ease, border-color .15s ease;
+  }
+  .resize-handle:hover::before{ border-color: var(--accent); opacity: .9; }
+
+  /* Absorbs whatever vertical slack is left between the eyebrow and the
+     control buttons by centering the radar+status group inside it, instead
+     of the old margin-top:auto on .controls, which dumped ALL of that slack
+     into the gap above the buttons and left them flush against the window's
+     bottom edge with no breathing room. min-height:0 lets it actually shrink
+     below its content's natural size if the window is ever too short,
+     instead of overflowing off the bottom (a flex item's default min-height
+     is auto, i.e. "never smaller than my content"). */
+  .body-center{
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+  }
+
   .radar-wrap{
     position: relative;
-    width: 172px;
-    height: 172px;
-    margin: 0 auto 12px;
+    width: 148px;
+    height: 148px;
+    margin: 0 auto 10px;
     flex-shrink: 0;
   }
 
   .rings-svg{ position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
   .arc{ fill: none; stroke: var(--accent); }
-  .a1{ stroke-width: 1;   stroke-dasharray: 16 12 5 20 24 7;  opacity: .3;  }
-  .a2{ stroke-width: 1;   stroke-dasharray: 34 16 9 26;       opacity: .4;  transform: rotate(35deg);  transform-origin: 100px 100px; }
-  .a3{ stroke-width: 1.4; stroke-dasharray: 11 9 32 15 7 22;  opacity: .5;  transform: rotate(-70deg); transform-origin: 100px 100px; }
-  .a4{ stroke-width: 1;   stroke-dasharray: 7 11 22 9;        opacity: .6;  transform: rotate(160deg); transform-origin: 100px 100px; }
+  .a1{ stroke-width: .8; stroke-dasharray: 14 11 4 18 20 6;  opacity: .28; }
+  .a2{ stroke-width: .8; stroke-dasharray: 30 14 8 22;       opacity: .36; transform: rotate(35deg);  transform-origin: 100px 100px; }
+  .a3{ stroke-width: 1.2;stroke-dasharray: 10 8 28 13 6 19;  opacity: .46; transform: rotate(-70deg); transform-origin: 100px 100px; }
+  .a4{ stroke-width: .8; stroke-dasharray: 6 10 19 8;        opacity: .52; transform: rotate(160deg); transform-origin: 100px 100px; }
+  .a5{ stroke-width: .6; stroke-dasharray: 2 6;              opacity: .38; }
+  .ticks{ stroke: var(--accent-2); stroke-width: 1; opacity: .5; }
+
+  /* Slowly-rotating ring of binary glyphs — populated at load by the script
+     below, positioned in the SAME 148px box as .radar-wrap so the trig in
+     that script and this box size must stay in sync. */
+  .binary-ring{
+    position: absolute; inset: 0;
+    animation: spin 34s linear infinite;
+  }
+  .binary-ring .bit{
+    position: absolute;
+    font-family: var(--font-mono);
+    font-size: 6.5px;
+    color: var(--accent-2);
+    opacity: .5;
+    text-shadow: 0 0 4px var(--accent-soft);
+  }
 
   .sweep{
     position: absolute; inset: 0; border-radius: 50%;
     background: conic-gradient(from 0deg,
-      transparent 0deg, transparent 268deg,
-      var(--accent-soft) 300deg, var(--accent) 328deg,
-      var(--accent-2) 336deg, transparent 337deg);
-    opacity: .8;
+      transparent 0deg, transparent 255deg,
+      var(--accent-soft) 292deg, var(--accent) 328deg,
+      var(--accent-2) 338deg, transparent 340deg);
+    opacity: .9;
+    mix-blend-mode: screen;
     animation: spin 2.6s linear infinite;
   }
   @keyframes spin{ to{ transform: rotate(360deg); } }
@@ -137,16 +225,55 @@
     30%{ opacity: 0; transform: scale(.6); }
   }
 
+  /* Small crosshair-style data-point reticles — purely decorative HUD detail,
+     static so they read as fixed "tracked" markers against the rotating rings. */
+  .reticle{ position: absolute; width: 10px; height: 10px; opacity: .55; }
+  .reticle::before, .reticle::after{
+    content: ''; position: absolute; background: var(--accent-2);
+  }
+  .reticle::before{ left: 50%; top: 0; width: 1px; height: 100%; transform: translateX(-50%); }
+  .reticle::after{ top: 50%; left: 0; height: 1px; width: 100%; transform: translateY(-50%); }
+  .reticle.r1{ top: 12%; right: 8%; }
+  .reticle.r2{ bottom: 16%; left: 6%; }
+
+  /* Tiny decorative readouts tucked in the radar's own corners — flavour
+     text only, never real telemetry, so they can't drift out of sync with
+     the assistant's actual state. */
+  .hud-readout{
+    position: absolute;
+    font-family: var(--font-mono);
+    font-size: 6.5px;
+    letter-spacing: .04em;
+    color: var(--accent-2);
+    opacity: .55;
+    text-shadow: 0 0 5px var(--accent-soft);
+    pointer-events: none;
+  }
+  .hud-readout.top-left{ top: -2px; left: -4px; }
+  .hud-readout.top-right{ top: -2px; right: -6px; text-align: right; }
+  .hud-bars{ display: flex; align-items: flex-end; gap: 1.5px; height: 8px; margin-top: 2px; }
+  .hud-bars i{ display:block; width: 2px; background: var(--accent-2); opacity: .7; animation: barpulse 1.6s ease-in-out infinite; }
+  .hud-bars i:nth-child(1){ height: 40%; animation-delay: 0s; }
+  .hud-bars i:nth-child(2){ height: 80%; animation-delay: .2s; }
+  .hud-bars i:nth-child(3){ height: 55%; animation-delay: .4s; }
+  .hud-bars i:nth-child(4){ height: 95%; animation-delay: .6s; }
+  .hud-bars i:nth-child(5){ height: 30%; animation-delay: .8s; }
+  @keyframes barpulse{ 0%,100%{ transform: scaleY(.6); } 50%{ transform: scaleY(1); } }
+
   .core{ position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
   .core-disc{
-    width: 82px; height: 82px; border-radius: 50%;
+    width: 70px; height: 70px; border-radius: 50%;
     background: radial-gradient(circle at 50% 32%, var(--accent-dim) 0%, var(--bg-panel2) 72%);
     border: 1px solid var(--accent);
     box-shadow: 0 0 26px -4px var(--accent-soft), inset 0 0 20px -6px var(--accent-soft);
     display: flex; align-items: center; justify-content: center;
   }
+  .core-ring{
+    position: absolute; inset: 6px; border-radius: 50%;
+    border: 1px solid var(--accent-2); opacity: .35;
+  }
   .core-dot{
-    width: 11px; height: 11px; border-radius: 50%;
+    width: 10px; height: 10px; border-radius: 50%;
     background: var(--accent-2);
     box-shadow: 0 0 18px 4px var(--accent-soft);
     animation: pulse 1.8s ease-in-out infinite;
@@ -159,85 +286,114 @@
     pointer-events: none;
   }
 
-  .status{ text-align: center; margin-bottom: 12px; }
+  .status{ text-align: center; margin-bottom: 10px; }
   .status-label{
-    font-weight: 600; font-size: 16px; letter-spacing: .06em;
-    text-transform: uppercase; color: var(--text);
+    font-family: var(--font-display);
+    font-weight: 800; font-size: 18px; letter-spacing: .07em;
+    text-transform: uppercase; color: #ffffff;
+    text-shadow: 0 0 16px var(--accent-soft), 0 0 3px rgba(255,255,255,.5);
   }
   .status-line{
-    font-family: var(--font-mono); font-size: 10px; color: var(--text-faint);
-    margin-top: 3px; letter-spacing: .02em;
+    font-family: var(--font-mono); font-size: 10px; color: var(--accent-2);
+    opacity: .8;
+    margin-top: 4px; letter-spacing: .02em;
+    text-shadow: 0 0 6px var(--accent-soft);
   }
 
-  /* ── controls — same two-row layout & fixed semantic colours as the main
-     JARVIS window's own INTERRUPT / MICROPHONE buttons ────────────────── */
-  .controls{ margin-top: auto; display: flex; flex-direction: column; gap: 7px; }
+  /* ── controls — unstacked into one row, both buttons frosted-glass by
+     default; the mic button additionally carries a neon border once its
+     state (on/off) is known. Fixed margin-top, not auto — see .body-center
+     above for why: this way the buttons always sit a consistent, comfortable
+     distance below the radar/status group and the same, deliberate .widget
+     padding-bottom below them, instead of variable leftover space collapsing
+     unpredictably at one edge. ──────────────────────────────────────────── */
+  .controls{ margin-top: 14px; flex-shrink: 0; display: flex; flex-direction: row; gap: 8px; }
 
   button.ctl{
     -webkit-app-region: no-drag;
+    flex: 1 1 0;
+    min-width: 0;
     font-family: var(--font-display);
     font-weight: 700;
-    font-size: 12px;
-    letter-spacing: .06em;
+    font-size: 11px;
+    letter-spacing: .04em;
     text-transform: uppercase;
-    border-radius: 6px;
-    padding: 9px 10px;
+    border-radius: 11px;
+    padding: 9px 6px;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 8px;
-    border: 1px solid var(--line);
-    background: transparent;
+    gap: 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    /* Base state: translucent, slightly frosted grey glass. */
+    border: 1px solid rgba(255,255,255,.14);
+    background: rgba(255,255,255,.07);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
     color: var(--text-dim);
     transition: all .15s ease;
   }
+  button.ctl:hover:not(:disabled){ background: rgba(255,255,255,.12); border-color: rgba(255,255,255,.22); }
   button.ctl:disabled{ opacity: .4; cursor: not-allowed; }
   button.ctl:focus-visible{ outline: 2px solid var(--accent); outline-offset: 2px; }
 
   #interruptBtn.live{
-    background: rgba(255,51,85,.12); color: var(--red); border-color: var(--red-dim);
+    background: rgba(255,51,85,.14); color: var(--red); border-color: var(--red);
+    box-shadow: 0 0 12px -1px rgba(255,51,85,.55), inset 0 0 10px -3px rgba(255,51,85,.3);
   }
-  #interruptBtn.live:hover:not(:disabled){ background: rgba(255,51,85,.2); border-color: var(--red); }
+  #interruptBtn.live:hover:not(:disabled){ background: rgba(255,51,85,.22); }
 
   #micBtn.on{
-    background: rgba(0,255,136,.1); color: var(--green); border-color: var(--green-dim);
+    background: rgba(4,14,10,.55); color: var(--green); border-color: var(--green);
+    box-shadow: 0 0 12px -1px rgba(0,255,136,.5), inset 0 0 10px -3px rgba(0,255,136,.25);
   }
-  #micBtn.on:hover:not(:disabled){ background: rgba(0,255,136,.16); border-color: var(--green); }
+  #micBtn.on:hover:not(:disabled){ background: rgba(4,14,10,.7); }
   #micBtn.off{
-    background: rgba(255,51,85,.1); color: var(--red); border-color: var(--red-dim);
+    background: rgba(16,4,6,.6); color: var(--red); border-color: var(--red);
+    box-shadow: 0 0 12px -1px rgba(255,51,85,.55), inset 0 0 10px -3px rgba(255,51,85,.28);
   }
-  #micBtn.off:hover:not(:disabled){ background: rgba(255,51,85,.16); border-color: var(--red); }
+  #micBtn.off:hover:not(:disabled){ background: rgba(16,4,6,.75); }
 
   @media (prefers-reduced-motion: reduce){
     .sweep{ animation: none; opacity: .6; }
-    .core-dot, .blip, .eyebrow .dot{ animation: none !important; }
+    .core-dot, .blip, .eyebrow .dot, .binary-ring, .hud-bars i{ animation: none !important; }
   }
 </style>
 </head>
 <body>
   <div class="widget">
+    <div class="resize-handle" id="resizeHandle" title="Drag to resize"></div>
     <div class="eyebrow">
-      <span class="id"><span class="dot"></span>SENTINEL // AWAKE</span>
+      <span class="id"><span class="dot" id="sentinelDot"></span>SENTINEL // <span id="sentinelState">AWAKE</span></span>
       <button class="close-btn" onclick="window.pywebview && window.pywebview.api.say_bye()" title="Dismiss">✕</button>
     </div>
 
-    <div class="radar-wrap">
-      <div class="halo"></div>
-      <svg class="rings-svg" viewBox="0 0 200 200">
-        <circle class="arc a1" cx="100" cy="100" r="96"/>
-        <circle class="arc a2" cx="100" cy="100" r="80"/>
-        <circle class="arc a3" cx="100" cy="100" r="62"/>
-        <circle class="arc a4" cx="100" cy="100" r="44"/>
-      </svg>
-      <div class="sweep"></div>
-      <div class="blip b1"></div><div class="blip b2"></div><div class="blip b3"></div>
-      <div class="core"><div class="core-disc"><div class="core-dot"></div></div></div>
-    </div>
+    <div class="body-center">
+      <div class="radar-wrap">
+        <div class="halo"></div>
+        <div class="hud-readout top-left">SIG<div class="hud-bars"><i></i><i></i><i></i><i></i><i></i></div></div>
+        <div class="hud-readout top-right">+ 00/930</div>
+        <svg class="rings-svg" viewBox="0 0 200 200">
+          <circle class="arc a1" cx="100" cy="100" r="98"/>
+          <circle class="arc a2" cx="100" cy="100" r="82"/>
+          <circle class="arc a3" cx="100" cy="100" r="64"/>
+          <circle class="arc a4" cx="100" cy="100" r="46"/>
+          <circle class="arc a5" cx="100" cy="100" r="90" stroke-dasharray="1 5"/>
+        </svg>
+        <div class="binary-ring" id="binaryRing"></div>
+        <div class="sweep"></div>
+        <div class="blip b1"></div><div class="blip b2"></div><div class="blip b3"></div>
+        <div class="reticle r1"></div><div class="reticle r2"></div>
+        <div class="core"><div class="core-disc"><div class="core-ring"></div><div class="core-dot"></div></div></div>
+      </div>
 
-    <div class="status">
-      <div class="status-label">Listening</div>
-      <div class="status-line">say "bye jarvis" to dismiss</div>
+      <div class="status">
+        <div class="status-label" id="statusLabel">Listening</div>
+        <div class="status-line">say "bye jarvis" to dismiss</div>
+      </div>
     </div>
 
     <div class="controls">
@@ -247,6 +403,73 @@
   </div>
 
 <script>
+  // ── Decorative binary-glyph ring, built in JS rather than hand-written SVG
+  //    so the character count/spacing can't drift out of sync with itself.
+  //    Positioned in the same 148px box as .radar-wrap (kept in sync with the
+  //    CSS width/height above) around a radius that sits between the core
+  //    disc and the outer dashed rings.
+  (function buildBinaryRing(){
+    const ring = document.getElementById('binaryRing');
+    const SIZE = 148, CENTER = SIZE / 2, RADIUS = 60, COUNT = 26;
+    for (let i = 0; i < COUNT; i++) {
+      const angle = (i / COUNT) * Math.PI * 2;
+      const x = CENTER + RADIUS * Math.cos(angle);
+      const y = CENTER + RADIUS * Math.sin(angle);
+      const deg = angle * 180 / Math.PI + 90;
+      const bit = document.createElement('span');
+      bit.className = 'bit';
+      bit.textContent = Math.random() < 0.5 ? '0' : '1';
+      bit.style.left = x + 'px';
+      bit.style.top = y + 'px';
+      bit.style.transform = `translate(-50%, -50%) rotate(${deg}deg)`;
+      ring.appendChild(bit);
+    }
+  })();
+
+  // ── Drag-to-resize: scales the whole page with CSS `zoom` and asks the
+  //    daemon (window.pywebview.api.resize_widget) to resize the actual OS
+  //    window to match, pivoted on the bottom-right corner where the widget
+  //    is docked. `zoom` and the native window size are changed by the SAME
+  //    factor, so the CSS layout viewport (what `100%`/`vw` resolve against)
+  //    stays fixed at the page's authored 300x336 size — everything just
+  //    renders bigger or smaller, nothing reflows or clips.
+  (function enableResize(){
+    const MIN_SCALE = 0.55, MAX_SCALE = 1.6, SENSITIVITY = 300;
+    const handle = document.getElementById('resizeHandle');
+    let dragging = false, startX = 0, startY = 0, startScale = 1;
+
+    function currentScale(){
+      const z = parseFloat(document.documentElement.style.zoom);
+      return isNaN(z) ? 1 : z;
+    }
+
+    function applyScale(scale){
+      scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
+      document.documentElement.style.zoom = scale;
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.resize_widget) {
+        window.pywebview.api.resize_widget(scale);
+      }
+    }
+
+    handle.addEventListener('mousedown', (e) => {
+      dragging = true;
+      startX = e.screenX;
+      startY = e.screenY;
+      startScale = currentScale();
+      e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!dragging) return;
+      // Moving the mouse up/left (negative delta from the drag start) grows
+      // the widget; down/right shrinks it — natural for a top-left handle.
+      const delta = ((startX - e.screenX) + (startY - e.screenY)) / 2;
+      applyScale(startScale + delta / SENSITIVITY);
+    });
+
+    window.addEventListener('mouseup', () => { dragging = false; });
+  })();
+
   // ── Accent colour: passed by the daemon as ?accent=#rrggbb (read from
   //    JARVIS's own config/api_keys.json ui_color) so this matches whatever
   //    theme the user picked in Customise, instead of a fixed blue.
@@ -275,12 +498,29 @@
   const micBtn = document.getElementById('micBtn');
   const interruptBtn = document.getElementById('interruptBtn');
   const statusLine = document.querySelector('.status-line');
+  const statusLabel = document.getElementById('statusLabel');
+  const sentinelState = document.getElementById('sentinelState');
+  const sentinelDot = document.getElementById('sentinelDot');
   let reachable = false;
 
+  // `s.awake` already reflects JARVIS's own wake-word gate (main.py's
+  // self._awake, served over this same /status endpoint) — it goes false
+  // when JARVIS auto-sleeps after its silence timeout, independently of
+  // whether this widget itself is still shown. Previously the eyebrow and
+  // status-label were hardcoded to "AWAKE"/"Listening" and never looked at
+  // it, so the widget kept reporting JARVIS as awake long after it had
+  // actually gone quiet.
   function renderState(s) {
     reachable = true;
     micBtn.disabled = false;
     interruptBtn.disabled = false;
+
+    sentinelState.textContent = s.awake ? 'AWAKE' : 'SLEEPING';
+    sentinelState.className = s.awake ? 'state-awake' : 'state-sleeping';
+    sentinelDot.className = 'dot ' + (s.awake ? 'state-awake' : 'state-sleeping');
+    sentinelDot.style.animationPlayState = s.awake ? 'running' : 'paused';
+    statusLabel.textContent = s.awake ? 'Listening' : 'Sleeping';
+
     if (s.muted) {
       micBtn.className = 'ctl off';
       micBtn.textContent = '🔇 MIC MUTED';
@@ -289,15 +529,25 @@
       micBtn.textContent = '🎙 MIC ACTIVE';
     }
     interruptBtn.className = s.speaking ? 'ctl live' : 'ctl';
-    statusLine.textContent = s.speaking
-      ? 'JARVIS is speaking — tap INTERRUPT to cut in'
-      : 'say "bye jarvis" to dismiss';
+
+    if (s.speaking) {
+      statusLine.textContent = 'JARVIS is speaking — tap INTERRUPT to cut in';
+    } else if (!s.awake) {
+      statusLine.textContent = 'say "Hey Jarvis" to wake me';
+    } else {
+      statusLine.textContent = 'say "bye jarvis" to dismiss';
+    }
   }
 
   function renderOffline() {
     reachable = false;
     micBtn.disabled = true;
     interruptBtn.disabled = true;
+    sentinelState.textContent = 'OFFLINE';
+    sentinelState.className = '';
+    sentinelDot.className = 'dot';
+    sentinelDot.style.animationPlayState = 'paused';
+    statusLabel.textContent = 'Offline';
     micBtn.className = 'ctl';
     micBtn.textContent = '⛔ JARVIS OFFLINE';
     interruptBtn.className = 'ctl';

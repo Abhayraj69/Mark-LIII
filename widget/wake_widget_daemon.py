@@ -16,6 +16,11 @@ Say "bye jarvis"  -> the widget disappears. There is no pretrained model for
                       "bye" and "jarvis" together. This only runs WHILE the
                       widget is visible, to keep it cheap the rest of the time.
 
+It can also be popped open/closed with a button instead of your voice — the
+main JARVIS window's "LAUNCH ARC SENTINEL" button talks to this daemon's own
+loopback control server (127.0.0.1:8766, see _start_control_server below)
+and calls /show, /hide or /toggle directly, same as saying the phrases would.
+
 Requires (not part of the main app's requirements.txt — install by hand):
     pip install pywebview openwakeword faster-whisper
 
@@ -29,11 +34,27 @@ running JARVIS.
 """
 from __future__ import annotations
 
-import collections
-import os
 import sys
+
+# ── Console encoding ─────────────────────────────────────────────────────
+# This daemon's own status lines carry emoji ("[Widget] ⚙ ..."-style
+# glyphs). On a non-UTF-8 console (cp1252 on this machine, cp1254/cp1251/
+# cp932 elsewhere) printing one raises UnicodeEncodeError and kills the
+# process — the same failure main.py fixed for itself (see its own
+# "Console encoding" comment); this standalone entry point needs the same
+# fix since nothing else applies it before print() runs.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import collections
+import json
+import os
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 BASE_DIR   = Path(__file__).resolve().parent.parent
@@ -46,6 +67,17 @@ BYE_WINDOW_S  = 3.0     # seconds of rolling audio checked for "bye jarvis"
 BYE_POLL_S    = 1.4     # how often that window is transcribed while visible
 PID_FILE      = WIDGET_DIR / ".wake_widget.pid"
 DEFAULT_ACCENT = "#00d4ff"   # matches ui.py's DEFAULT_UI_COLOR (unthemed default)
+CONTROL_PORT  = 8766    # loopback-only — separate from JARVIS's own 8765 (core/local_control.py)
+
+# Widget's authored size — the HTML/CSS (radar geometry, font sizes, corner
+# readouts) is all fixed px, laid out for exactly this box. The drag-to-resize
+# handle (see arc_sentinel_widget.html) scales the page uniformly with CSS
+# `zoom` relative to this, so every element shrinks/grows together instead of
+# reflowing. MIN/MAX bound how far that zoom can go — small enough to still
+# read as the same HUD, not so small it becomes an unreadable speck or, at
+# the top end, so large it swallows half the screen.
+WIDGET_WIDTH, WIDGET_HEIGHT = 300, 336
+WIDGET_MIN_SCALE, WIDGET_MAX_SCALE = 0.55, 1.6
 
 
 def _get_accent_hex() -> str:
@@ -225,7 +257,76 @@ def _js_api(controller: WidgetController):
     class Api:
         def say_bye(self):
             controller.on_bye_jarvis()
+
+        def resize_widget(self, scale):
+            """Called by the corner drag-handle's JS as the user resizes.
+            `scale` is the ratio the page has already applied to itself via
+            CSS zoom (see arc_sentinel_widget.html) — this just makes the
+            actual OS window match, fixed at the bottom-right corner so a
+            widget docked there doesn't drift off screen as it grows/shrinks
+            from its top-left handle."""
+            try:
+                from webview.window import FixPoint   # deferred: see the `import webview` note in main()
+                scale = max(WIDGET_MIN_SCALE, min(WIDGET_MAX_SCALE, float(scale)))
+                controller.window.resize(
+                    int(WIDGET_WIDTH * scale), int(WIDGET_HEIGHT * scale),
+                    fix_point=FixPoint.SOUTH | FixPoint.EAST,
+                )
+            except Exception as e:
+                print(f"[Widget] Resize failed: {e}")
     return Api()
+
+
+def _start_control_server(controller: WidgetController) -> None:
+    """A tiny loopback-only HTTP server so a button click elsewhere on this
+    machine (the main JARVIS window's "LAUNCH ARC SENTINEL" button) can pop
+    this exact widget instance open or closed on demand, instead of only
+    reacting to 'Hey Jarvis' / 'bye jarvis'. Binds 127.0.0.1 only, same
+    reasoning as core/local_control.py: nothing off-machine can ever reach
+    it, and anything already running locally already has full mic/filesystem
+    access, so a token here would protect against nothing real."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def _json(self, obj, code: int = 200) -> None:
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+        def do_GET(self) -> None:
+            if self.path == "/status":
+                self._json({"visible": controller.visible})
+            else:
+                self._json({"error": "not found"}, 404)
+
+        def do_POST(self) -> None:
+            if self.path == "/show":
+                controller.on_hey_jarvis()
+            elif self.path == "/hide":
+                controller.on_bye_jarvis()
+            elif self.path == "/toggle":
+                (controller.on_bye_jarvis if controller.visible else controller.on_hey_jarvis)()
+            else:
+                self._json({"error": "not found"}, 404)
+                return
+            self._json({"visible": controller.visible})
+
+        def log_message(self, *_args) -> None:
+            pass   # keep the console clean — same as core/local_control.py
+
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", CONTROL_PORT), Handler)
+    except OSError as e:
+        print(f"[Widget] Control port {CONTROL_PORT} unavailable ({e}) — "
+              "the main app's button trigger won't reach this instance "
+              "(voice trigger still works).")
+        return
+    threading.Thread(target=httpd.serve_forever, daemon=True, name="WidgetControl").start()
 
 
 def main() -> None:
@@ -305,10 +406,14 @@ def main() -> None:
                 print(f"[Widget] Could not open any microphone: {e2}")
 
     # ── window: frameless, always-on-top, bottom-right corner, hidden until
-    #    'Hey Jarvis' fires. webview.screens[] resolves before start(), so the
-    #    window is created in its final spot instead of jumping there once
-    #    loaded. ──────────────────────────────────────────────────────────
-    width, height, margin = 320, 300, 24
+    #    'Hey Jarvis' fires (or the main app's button calls /show). webview.
+    #    screens[] resolves before start(), so the window is created in its
+    #    final spot instead of jumping there once loaded. Sized to the
+    #    widget's actual content (eyebrow + 148px radar + status text + one
+    #    row of two control buttons, ~300px with padding) plus headroom —
+    #    smaller than the old two-row layout since the buttons now sit
+    #    side-by-side instead of stacked. ─────────────────────────────────
+    width, height, margin = WIDGET_WIDTH, WIDGET_HEIGHT, 24
     x = y = None
     try:
         screen = webview.screens[0]
@@ -320,15 +425,21 @@ def main() -> None:
     from urllib.parse import quote
     page_url = f"{WIDGET_DIR / 'arc_sentinel_widget.html'}?accent={quote(_get_accent_hex())}"
 
+    # min_size must be set explicitly: pywebview's own default (200, 100)
+    # would otherwise silently clamp resize() calls before they ever reach
+    # WIDGET_MIN_SCALE's floor, since WinForms enforces MinimumSize on the
+    # native window regardless of who asked for the resize.
     window = webview.create_window(
         "Arc Sentinel",
         url=page_url,
         width=width, height=height, x=x, y=y,
-        frameless=True, on_top=True, easy_drag=True,
+        frameless=True, on_top=True, easy_drag=True, resizable=True,
+        min_size=(int(WIDGET_WIDTH * WIDGET_MIN_SCALE), int(WIDGET_HEIGHT * WIDGET_MIN_SCALE)),
         js_api=_js_api(controller),
         hidden=True,
     )
     controller.window = window
+    _start_control_server(controller)
     window.events.loaded += lambda: threading.Thread(target=start_backend, daemon=True).start()
     webview.start()
 
