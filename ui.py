@@ -1631,8 +1631,9 @@ class PluginManagerOverlay(QWidget):
 
     _OW = 420
 
-    def __init__(self, plugins: list[dict], parent=None):
+    def __init__(self, plugins: list[dict], parent=None, on_reload_all=None):
         super().__init__(parent)
+        self._on_reload_all = on_reload_all   # callable: () -> (bool, str), or None
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             PluginManagerOverlay {{
@@ -1665,6 +1666,29 @@ class PluginManagerOverlay(QWidget):
             lay.addLayout(self._build_row(p))
 
         lay.addSpacing(4)
+
+        if self._on_reload_all is not None:
+            self._reload_status = QLabel("")
+            self._reload_status.setFont(QFont("Courier New", 7))
+            self._reload_status.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+            self._reload_status.setWordWrap(True)
+            self._reload_status.hide()
+            lay.addWidget(self._reload_status)
+
+            reload_btn = QPushButton("RELOAD ALL")
+            reload_btn.setFixedHeight(30)
+            reload_btn.setFont(QFont("Courier New", 9))
+            reload_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            reload_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; color: {C.PRI};
+                    border: 1px solid {C.BORDER_B}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ background: rgba(255,255,255,10); }}
+            """)
+            reload_btn.clicked.connect(self._do_reload_all)
+            lay.addWidget(reload_btn)
+
         close_btn = QPushButton("CLOSE")
         close_btn.setFixedHeight(30)
         close_btn.setFont(QFont("Courier New", 9))
@@ -1735,6 +1759,20 @@ class PluginManagerOverlay(QWidget):
         new_val = not get_plugin_enabled(name)
         save_plugin_enabled(name, new_val)
         self._style_toggle(btn, new_val)
+
+    def _do_reload_all(self):
+        if self._on_reload_all is None:
+            return
+        try:
+            ok, msg = self._on_reload_all()
+        except Exception as e:
+            ok, msg = False, f"Reload failed: {e}"
+        self._reload_status.setStyleSheet(
+            f"color: {C.GREEN if ok else C.ACC}; background: transparent;"
+        )
+        self._reload_status.setText(msg.splitlines()[0] if msg else "Done.")
+        self._reload_status.show()
+        self.adjustSize()
 
 
 class _HudOverlay(QWidget):
@@ -1837,6 +1875,87 @@ class ConfirmBanner(_HudOverlay):
         # safe answer wins.
         no.setDefault(True)
         no.setFocus()
+
+
+class SuggestionHint(_HudOverlay):
+    """A dismissible, non-blocking nudge from the Predictive Assistant.
+
+    Unlike ConfirmBanner this never gates anything irreversible — it is just
+    "here's a pattern I noticed", parked in a corner so it never steals focus
+    from whatever the user is doing. It still never runs anything on its own:
+    RUN only fires the callback the same way CONFIRM does on ConfirmBanner,
+    and the caller decides what running the suggested action means."""
+
+    answered = pyqtSignal(bool)
+    _OW = 340
+
+    def __init__(self, suggestion: dict, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            SuggestionHint {{
+                background: rgba(6, 10, 14, 235);
+                border: 1px solid {C.PRI};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 12, 16, 12)
+        lay.setSpacing(6)
+
+        pct = round(float(suggestion.get("confidence_score", 0.0)) * 100)
+        hdr = QLabel(f"💡 SUGGESTION — {pct}% confidence")
+        hdr.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        lay.addWidget(hdr)
+
+        act = QLabel(str(suggestion.get("action", "")))
+        act.setWordWrap(True)
+        act.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        act.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        lay.addWidget(act)
+
+        reasoning = str(suggestion.get("reasoning", ""))
+        if reasoning:
+            why = QLabel(reasoning)
+            why.setWordWrap(True)
+            why.setFont(QFont("Courier New", 8))
+            why.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+            lay.addWidget(why)
+
+        row = QHBoxLayout(); row.setSpacing(8)
+
+        run = QPushButton("▸  RUN")
+        run.setFixedHeight(28)
+        run.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        run.setCursor(Qt.CursorShape.PointingHandCursor)
+        run.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.PRI};
+                border: 1px solid {C.PRI}; border-radius: 3px; }}
+            QPushButton:hover {{ background: rgba(255,255,255,20); }}
+        """)
+        run.clicked.connect(lambda: self.answered.emit(True))
+        row.addWidget(run)
+
+        dismiss = QPushButton("DISMISS")
+        dismiss.setFixedHeight(28)
+        dismiss.setFont(QFont("Courier New", 9))
+        dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
+        dismiss.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px; }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        dismiss.clicked.connect(lambda: self.answered.emit(False))
+        row.addWidget(dismiss)
+        lay.addLayout(row)
+
+        # Default focus on DISMISS: a suggestion sitting unattended should
+        # never be one stray Enter press away from running.
+        dismiss.setDefault(True)
+        dismiss.setFocus()
 
 
 class AudioDeviceOverlay(_HudOverlay):
@@ -2745,8 +2864,11 @@ class MainWindow(QMainWindow):
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
     _confirm_sig    = pyqtSignal(str, str)   # (title, detail) — irreversible-action gate
     _confirm_hide_sig = pyqtSignal()
+    _suggestion_sig = pyqtSignal(object)     # dict from predictive_assistant.Suggestion — proactive hint
+    _suggestion_hide_sig = pyqtSignal()
     _wake_dl_sig    = pyqtSignal(bool, str)  # wake-word install finished (ok, message)
     _mute_toggle_sig = pyqtSignal()          # flip mic mute from any thread (e.g. the widget's control server)
+    _remote_tailscale_sig = pyqtSignal(object)  # (url,key,auto,manual,permanent) from the tailscale-lookup thread
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -2774,12 +2896,16 @@ class MainWindow(QMainWindow):
 
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
+        self.on_remote_tailscale_clicked = None   # callable: () -> (url, key, auto, manual, permanent) | None — blocking, call off the Qt thread
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
+        self.on_suggestion_decision = None  # callable: (accepted: bool, suggestion: dict) -> None, set by JarvisLive
+        self._suggestion_overlay = None  # live SuggestionHint, if one is on screen
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
+        self.reload_all_skills = None   # callable: () -> (bool, str), set by JarvisLive
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
         self.on_wake_manual    = None   # callable: () -> None — manual sleep/wake
         self.wake_get_state    = None   # callable: () -> dict {enabled, awake, ready}
@@ -2896,10 +3022,13 @@ class MainWindow(QMainWindow):
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
         self._confirm_hide_sig.connect(self._hide_confirm_banner)
+        self._suggestion_sig.connect(self._show_suggestion_hint)
+        self._suggestion_hide_sig.connect(self._hide_suggestion_hint)
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._clipboard_sig.connect(self._show_clipboard_panel)
         self._wake_dl_sig.connect(self._on_wake_install_done)
+        self._remote_tailscale_sig.connect(self._on_remote_tailscale_ready)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -3344,29 +3473,77 @@ class MainWindow(QMainWindow):
 
     def _launch_arc_widget(self):
         """
-        Starts widget/wake_widget_daemon.py — the voice-triggered Arc Sentinel
-        widget — as a separate, detached process. Self-contained like
-        _create_desktop_shortcut() above: it needs no state from JarvisLive,
-        so it doesn't route through main.py at all. A crash or a missing
-        dependency there can never affect this window or the live session.
+        Pops the Arc Sentinel widget open (or closed) right now, from a
+        button click — no need to say "Hey Jarvis" first. Talks to the
+        daemon's own loopback control port (127.0.0.1:8766, see
+        widget/wake_widget_daemon.py's _start_control_server) so a click
+        while it's already running just shows/hides that same instance.
+
+        First click starts widget/wake_widget_daemon.py as a separate,
+        detached process — self-contained like _create_desktop_shortcut()
+        above: it needs no state from JarvisLive, so it doesn't route
+        through main.py at all, and a crash or missing dependency there can
+        never affect this window or the live session. The whole exchange
+        runs off the Qt thread since it involves network calls (and, on
+        first launch, waiting for the daemon to load its wake-word model).
         """
-        script = Path(__file__).resolve().parent / "widget" / "wake_widget_daemon.py"
-        if not script.exists():
-            self._log.append_log("ERR: widget/wake_widget_daemon.py not found.")
-            return
+        import urllib.request
 
-        python  = Path(sys.executable)
-        pythonw = python.parent / "pythonw.exe"
-        target  = str(pythonw if pythonw.exists() else python)
+        CONTROL = "http://127.0.0.1:8766"
 
-        try:
-            subprocess.Popen([target, str(script)], cwd=str(script.parent))
-            self._log.append_log(
-                "SYS: Arc Sentinel widget launching — say 'Hey Jarvis' to show it, "
-                "'bye jarvis' to dismiss it."
+        def _reachable(timeout: float = 0.3) -> bool:
+            try:
+                urllib.request.urlopen(CONTROL + "/status", timeout=timeout)
+                return True
+            except Exception:
+                return False
+
+        def _post(path: str, timeout: float = 1.5) -> bool:
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(CONTROL + path, method="POST"), timeout=timeout
+                )
+                return True
+            except Exception:
+                return False
+
+        def _work():
+            if _reachable():
+                _post("/toggle")
+                self._log_sig.emit("SYS: Arc Sentinel toggled.")
+                return
+
+            script = Path(__file__).resolve().parent / "widget" / "wake_widget_daemon.py"
+            if not script.exists():
+                self._log_sig.emit("ERR: widget/wake_widget_daemon.py not found.")
+                return
+
+            python  = Path(sys.executable)
+            pythonw = python.parent / "pythonw.exe"
+            target  = str(pythonw if pythonw.exists() else python)
+
+            try:
+                subprocess.Popen([target, str(script)], cwd=str(script.parent))
+            except Exception as e:
+                self._log_sig.emit(f"ERR: Could not launch widget — {e}")
+                return
+
+            self._log_sig.emit("SYS: Arc Sentinel widget starting…")
+            # First launch loads the wake-word model before its control port
+            # comes up — poll for it rather than guessing a fixed delay.
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if _reachable():
+                    _post("/show")
+                    self._log_sig.emit("SYS: Arc Sentinel widget ready.")
+                    return
+                time.sleep(0.3)
+            self._log_sig.emit(
+                "ERR: Arc Sentinel widget didn't come up in time — check its console "
+                "for missing dependencies (pywebview / openwakeword / faster-whisper)."
             )
-        except Exception as e:
-            self._log.append_log(f"ERR: Could not launch widget — {e}")
+
+        threading.Thread(target=_work, daemon=True, name="arc-widget-launch").start()
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -3719,8 +3896,25 @@ class MainWindow(QMainWindow):
         remote_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         remote_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         remote_btn.setStyleSheet(_BTN_STYLE_PRI)
+        remote_btn.setToolTip("QR code / 6-digit key for phones on this same Wi-Fi.")
         remote_btn.clicked.connect(self._open_remote)
         lay.addWidget(remote_btn)
+
+        remote_net_btn = QPushButton("🔒  REMOTE (TAILSCALE)")
+        remote_net_btn.setFixedHeight(30)
+        remote_net_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        remote_net_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        remote_net_btn.setStyleSheet(_BTN_STYLE_DIM)
+        remote_net_btn.setToolTip(
+            "Reach JARVIS from anywhere with internet, not just this Wi-Fi — "
+            "over your private Tailscale network, never exposed to the public "
+            "internet. Needs Tailscale installed and signed in on THIS PC and "
+            "on your phone (one-time setup, not done by this button). Once "
+            "set up, the link is permanent and doesn't change between JARVIS "
+            "restarts."
+        )
+        remote_net_btn.clicked.connect(self._open_remote_tailscale)
+        lay.addWidget(remote_net_btn)
 
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
@@ -3784,8 +3978,9 @@ class MainWindow(QMainWindow):
         widget_btn.setFixedHeight(30)
         widget_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         widget_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        widget_btn.setToolTip("Starts the voice-triggered widget — say 'Hey Jarvis' "
-                              "to show it, 'bye jarvis' to dismiss it.")
+        widget_btn.setToolTip("Pops the Arc Sentinel widget open/closed right now. "
+                              "Once running, it also opens on 'Hey Jarvis' and "
+                              "closes on 'bye jarvis'.")
         widget_btn.setStyleSheet(_BTN_STYLE_PRI)
         widget_btn.clicked.connect(self._launch_arc_widget)
         lay.addWidget(widget_btn)
@@ -4043,6 +4238,58 @@ class MainWindow(QMainWindow):
         ov.show()
         self._remote_overlay = ov
         self._log.append_log(f"SYS: Remote key generated — manual: {manual or url}")
+
+    def _open_remote_tailscale(self):
+        """Reading Tailscale's status shells out to the `tailscale` CLI, so
+        this runs off the Qt thread on general principle — see
+        JarvisLive._make_remote_key_tailscale — even though it's normally
+        fast (unlike the Cloudflare Tunnel this replaced, there's no
+        multi-second "wait for a public hostname to register" step). The
+        result comes back through _remote_tailscale_sig so the overlay is
+        only ever built on the Qt thread."""
+        if not self.on_remote_tailscale_clicked:
+            self._log.append_log("SYS: Dashboard not running — remote unavailable.")
+            return
+        self._log_sig.emit("SYS: Checking Tailscale status…")
+
+        def _work():
+            try:
+                result = self.on_remote_tailscale_clicked()
+            except Exception as e:
+                self._log_sig.emit(f"ERR: Tailscale remote failed — {e}")
+                return
+            self._remote_tailscale_sig.emit(result)
+
+        threading.Thread(target=_work, daemon=True, name="remote-tailscale").start()
+
+    def _on_remote_tailscale_ready(self, result):
+        if not result:
+            self._log.append_log("SYS: Could not set up Tailscale remote — see log above.")
+            return
+        url, key, auto, manual, permanent = result
+        if self._remote_overlay:
+            self._remote_overlay._do_close()
+        cw  = self.centralWidget()
+        ow, oh = RemoteKeyOverlay._OW, RemoteKeyOverlay._OH
+        ov  = RemoteKeyOverlay(url, key, auto_login_url=auto, manual_url=manual,
+                               expiry_secs=600, parent=cw)
+        # NOT on_remote_tailscale_clicked directly: RemoteKeyOverlay's NEW KEY
+        # button calls its callback synchronously on the Qt thread. Routing
+        # through _open_remote_tailscale keeps every call threaded, same as
+        # the initial launch, so a slow or hung `tailscale` CLI call can
+        # never freeze the app — the overlay just closes and reopens once
+        # the refreshed key is ready instead of updating in place.
+        ov.set_new_key_callback(self._open_remote_tailscale)
+        ov.setGeometry(
+            (cw.width()  - ow) // 2,
+            (cw.height() - oh) // 2,
+            ow, oh,
+        )
+        ov.closed.connect(lambda: setattr(self, '_remote_overlay', None))
+        ov.show()
+        self._remote_overlay = ov
+        kind = "PERMANENT" if permanent else "TEMPORARY"
+        self._log.append_log(f"SYS: Tailscale remote ready ({kind}): {manual or url}")
 
     # ── Auto-start ──────────────────────────────────────────────────────────────
 
@@ -4412,10 +4659,43 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log.append_log(f"ERR: Confirmation failed — {e}")
 
+    # ── Predictive Assistant hint ────────────────────────────────────────────
+
+    def _show_suggestion_hint(self, suggestion: dict):
+        self._hide_suggestion_hint()
+        ov = SuggestionHint(suggestion, parent=self.centralWidget())
+        ov.answered.connect(lambda accepted: self._on_suggestion_answered(accepted, suggestion))
+        cw = self.centralWidget()
+        ov.adjustSize()
+        margin = 16
+        ov.setGeometry(
+            max(0, cw.width() - ov.width() - margin),
+            max(0, cw.height() - ov.height() - margin),
+            ov.width(), ov.height(),
+        )
+        ov.show()
+        ov.raise_()
+        self._suggestion_overlay = ov
+
+    def _hide_suggestion_hint(self):
+        ov = self._suggestion_overlay
+        if ov is not None:
+            ov.hide()
+            ov.deleteLater()
+            self._suggestion_overlay = None
+
+    def _on_suggestion_answered(self, accepted: bool, suggestion: dict):
+        self._hide_suggestion_hint()
+        if self.on_suggestion_decision:
+            try:
+                self.on_suggestion_decision(bool(accepted), suggestion)
+            except Exception as e:
+                self._log.append_log(f"ERR: Suggestion handling failed — {e}")
+
     def _open_plugin_manager(self):
         plugins = self.get_plugins() if self.get_plugins else []
         cw = self.centralWidget()
-        ov = PluginManagerOverlay(plugins, parent=cw)
+        ov = PluginManagerOverlay(plugins, parent=cw, on_reload_all=self.reload_all_skills)
         ov.adjustSize()
         ov.setGeometry(
             (cw.width()  - ov.width())  // 2,
@@ -4607,6 +4887,14 @@ class JarvisUI:
         self._win.on_remote_clicked = cb
 
     @property
+    def on_remote_tailscale_clicked(self):
+        return self._win.on_remote_tailscale_clicked
+
+    @on_remote_tailscale_clicked.setter
+    def on_remote_tailscale_clicked(self, cb):
+        self._win.on_remote_tailscale_clicked = cb
+
+    @property
     def on_interrupt(self):
         return self._win.on_interrupt
 
@@ -4639,6 +4927,24 @@ class JarvisUI:
         """Thread-safe: take the gate down."""
         self._win._confirm_hide_sig.emit()
 
+    def show_suggestion(self, suggestion: dict) -> None:
+        """Thread-safe: raise a dismissible Predictive Assistant hint. Called
+        from the asyncio dispatch path, which may not be on the Qt thread."""
+        self._win._suggestion_sig.emit(suggestion)
+
+    def hide_suggestion(self) -> None:
+        """Thread-safe: take the hint down without a decision (e.g. a newer
+        suggestion superseding it)."""
+        self._win._suggestion_hide_sig.emit()
+
+    @property
+    def on_suggestion_decision(self):
+        return self._win.on_suggestion_decision
+
+    @on_suggestion_decision.setter
+    def on_suggestion_decision(self, cb):
+        self._win.on_suggestion_decision = cb
+
     @property
     def get_plugins(self):
         return self._win.get_plugins
@@ -4654,6 +4960,14 @@ class JarvisUI:
     @get_plugin_settings.setter
     def get_plugin_settings(self, cb):
         self._win.get_plugin_settings = cb
+
+    @property
+    def reload_all_skills(self):
+        return self._win.reload_all_skills
+
+    @reload_all_skills.setter
+    def reload_all_skills(self, cb):
+        self._win.reload_all_skills = cb
 
     @property
     def on_wake_toggle(self):

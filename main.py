@@ -50,6 +50,7 @@ for _stream in (_sys.stdout, _sys.stderr):
         pass
 
 import asyncio
+import contextlib
 import re
 import threading
 import time
@@ -85,7 +86,7 @@ from actions.background_monitor import (
 )
 from memory.config_manager     import (
     get_brief_enabled, get_voice, get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
-    is_local_engine_enabled, get_plugin_config, get_plugin_setting,
+    is_local_engine_enabled, get_plugin_config, get_plugin_setting, save_plugin_config,
 )
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
@@ -100,7 +101,9 @@ from core                      import fast_intent
 from core                      import predictive_assistant
 from core                      import causal_reasoning
 from core                      import context_manager
+from core                      import sequence_memory
 from core                      import sentiment_adapter
+from core                      import telemetry
 from tool_connectors.registry  import ToolRegistry
 
 # How long the assistant stays awake with no user speech before it auto-sleeps
@@ -431,6 +434,11 @@ class JarvisLive:
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
         self._interrupted          = False   # True while draining audio after user interrupt
+        self._local_stream_cancel  = threading.Event()  # set by interrupt() to stop a Local-Mode stream mid-flight
+        self._local_tts_queue      = None    # queue.Queue[str|None] draining sentences to TTS during Local Mode
+        self._local_tts_player     = None    # active TTSPlayer during Local Mode, so interrupt() can stop() it
+        self._current_turn         = None    # core.telemetry.Turn for the in-flight Gemini Live exchange, if any
+        self._active_suggestion    = None    # dict shown via ui.show_suggestion(), mirrored to the phone dashboard
         self.ui.on_text_command   = self._on_text_command
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_remote_tailscale_clicked = self._make_remote_key_tailscale
@@ -496,6 +504,7 @@ class JarvisLive:
         )
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = self._settings_schemas  # ⚙ settings tab
+        self.ui.reload_all_skills = self._reload_all_skills   # Plugin Manager: RELOAD ALL
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
         # tool_connectors/: a second registry (git/Docker/filesystem today),
@@ -511,6 +520,30 @@ class JarvisLive:
         self._connector_declarations = self._tool_connector_registry.get_tool_declarations(
             reserved_names=_names_incl_plugins
         )
+
+        # ── Skill hot reload (core/skill_watcher.py) ───────────────────────────
+        # Off by default, and — like ENGINE mode above — read once at startup:
+        # the watcher is a background thread, and toggling it live would need
+        # its own start/stop plumbing for one setting nobody changes mid-run.
+        # Local Mode already rebuilds its tool list fresh every turn (see
+        # _run_local_loop), so only Live mode needs the reconnect nudge below.
+        self._skill_watcher = None
+        if bool(get_plugin_config("hot_reload").get("enabled", False)):
+            from core.skill_watcher import SkillWatcher
+
+            def _on_skills_reloaded(reason: str):
+                if self._mode == "cloud":
+                    self.request_reconnect(keep_context=True, reason=reason)
+
+            self._skill_watcher = SkillWatcher(
+                plugins_dir=_base_dir / "plugins",
+                actions_dir=_base_dir / "actions",
+                plugin_registry=self._plugin_registry,
+                action_registry=self._action_registry,
+                on_change=_on_skills_reloaded,
+                logger=lambda msg: (print(msg), self.ui.write_log(f"SYS: {msg}")),
+            )
+            self._skill_watcher.start()
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
@@ -718,8 +751,178 @@ class JarvisLive:
 
     def _settings_schemas(self) -> list[dict]:
         return ([self._engine_settings_section(), self._claude_settings_section(),
-                  self._fast_commands_section(), self._sentiment_settings_section()]
+                  self._fast_commands_section(), self._sentiment_settings_section(),
+                  self._performance_settings_section(), self._routing_settings_section(),
+                  self._mcp_settings_section(), self._hot_reload_settings_section()]
                 + self._plugin_registry.settings_schemas())
+
+    # ── Skill hot reload (core/skill_watcher.py) ───────────────────────────────
+    # Same generic PluginSettingsOverlay rendering as every section above.
+    # Like ENGINE mode, the toggle itself needs a restart to take effect (the
+    # watcher thread is started once in __init__) — this section exists so
+    # the setting is visible and persisted, not to apply it live.
+    def _hot_reload_settings_section(self) -> dict:
+        return {
+            "plugin":    "hot_reload",
+            "namespace": "hot_reload",
+            "title":     "🔁 HOT RELOAD — reload plugins/actions on file save (restart to apply)",
+            "fields": [
+                {"key": "enabled", "type": "toggle",
+                 "label": "Watch plugins/ and actions/ and reload changed files automatically",
+                 "default": False},
+            ],
+            "values": get_plugin_config("hot_reload"),
+            "action": {"label": "RELOAD ALL NOW", "run": self._reload_all_skills},
+        }
+
+    def _reload_all_skills(self, values: dict) -> tuple[bool, str]:
+        """Manual one-shot reload — works whether or not the background
+        watcher is running, since it drives the same registry.reload_all()
+        the watcher itself calls per-file."""
+        plugin_results = self._plugin_registry.reload_all()
+        action_results = self._action_registry.reload_all()
+        changed = [f"{name}: {msg}" for name, ok, msg in plugin_results + action_results if ok]
+        failed  = [f"{name}: {msg}" for name, ok, msg in plugin_results + action_results if not ok
+                   and "no TOOL dict" not in msg]
+        if self._mode == "cloud" and changed:
+            self.request_reconnect(keep_context=True, reason="skills reloaded")
+        lines = [f"Reloaded {len(changed)} file(s)."]
+        lines += changed[:10]
+        if failed:
+            lines.append(f"{len(failed)} failed:")
+            lines += failed[:10]
+        return (not failed, "\n".join(lines))
+
+    # ── MCP connector (tool_connectors/connectors/mcp_connector.py) ───────────
+    # Server list is edited as raw JSON in one text field rather than a
+    # repeating add/remove row widget — same PluginSettingsOverlay rendering,
+    # no new Qt code. CHECK SERVER HEALTH reuses the connector registry's own
+    # health_report(), which already never raises per server (see
+    # tool_connectors/mcp_connector_base.py's health_check()).
+    def _mcp_settings_section(self) -> dict:
+        return {
+            "plugin":    "mcp_connector",
+            "namespace": "mcp_connector",
+            "title":     "🔌 MCP SERVERS — connect Model Context Protocol servers",
+            "fields": [
+                {"key": "mcp_servers_json", "type": "text", "label": 'Servers (JSON list — see tool_connectors/README.md)',
+                 "default": "[]"},
+            ],
+            "values": {"mcp_servers_json": json.dumps(
+                get_plugin_config("mcp_connector").get("mcp_servers", []))},
+            "action": {"label": "CHECK SERVER HEALTH", "run": self._check_mcp_health},
+        }
+
+    def _check_mcp_health(self, values: dict) -> tuple[bool, str]:
+        raw = values.get("mcp_servers_json", "[]")
+        try:
+            servers = json.loads(raw or "[]")
+        except json.JSONDecodeError as e:
+            return False, f"Invalid JSON: {e}"
+        if not isinstance(servers, list):
+            return False, "mcp_servers must be a JSON list of {name, transport, command|url} objects."
+
+        # Persist under the key mcp_connector.py's config reader actually
+        # expects (this section's own "mcp_servers_json" field is just this
+        # UI's edit box), then re-discover so health reflects what was just typed.
+        save_plugin_config("mcp_connector", {"mcp_servers": servers})
+        registry = ToolRegistry(logger=lambda _msg: None).discover()
+        if not registry.connectors():
+            return (servers == [], "No MCP servers configured." if servers == [] else
+                    "No servers registered — check names/transport in the JSON above.")
+
+        report = registry.health_report()
+        lines = [f"{'✓' if ok else '✗'} {name}" for name, ok in sorted(report.items())]
+        return all(report.values()), "\n".join(lines)
+
+    # ── Backend router (core/backend_router.py) ───────────────────────────────
+    # One comma-separated text field per TaskKind rather than a new dropdown-
+    # per-row widget — same PluginSettingsOverlay rendering as every section
+    # above, no new Qt code. Read by core.backend_router.load_policy_from_config()
+    # whenever a caller (e.g. actions/dev_agent.py, once migrated) asks for a
+    # policy built from these saved values instead of DEFAULT_POLICY.
+    def _routing_settings_section(self) -> dict:
+        from core.backend_router import DEFAULT_POLICY, TaskKind
+        saved = get_plugin_config("routing")
+        return {
+            "plugin":    "routing",
+            "namespace": "routing",
+            "title":     "🧭 ROUTING — backend order per task kind (comma-separated)",
+            "fields": [
+                {"key": kind.value, "type": "text", "label": kind.value.replace("_", " ").title(),
+                 "default": ", ".join(DEFAULT_POLICY[kind])}
+                for kind in TaskKind
+            ],
+            "values": saved,
+            "action": {"label": "TEST ALL BACKENDS", "run": self._test_all_backends},
+        }
+
+    def _test_all_backends(self, values: dict) -> tuple[bool, str]:
+        """Quick health probe for ollama/claude/gemini — independent of the
+        saved routing order, since a backend's reachability doesn't depend on
+        which task kinds are configured to use it."""
+        import time as _time
+        from core import llm_client
+        from core.claude_bridge import get_claude_config, get_claude_settings
+
+        results = []
+        t0 = _time.monotonic()
+        reachable = llm_client.ensure_ollama_running(timeout=3)
+        results.append(f"ollama: {'reachable' if reachable else 'unreachable'} "
+                        f"({(_time.monotonic()-t0)*1000:.0f}ms)")
+
+        api_key, _, _ = get_claude_settings(get_claude_config())
+        results.append(f"claude: {'configured' if api_key else 'no API key'}")
+
+        gemini_key = _load_api_config().get("gemini_api_key", "")
+        results.append(f"gemini: {'configured' if gemini_key else 'no API key'}")
+
+        return True, "\n".join(results)
+
+    # ── Per-turn telemetry (core/telemetry.py) ────────────────────────────────
+    # Same generic PluginSettingsOverlay rendering as every section above — the
+    # "days" field is the only persisted value, and REFRESH STATS reuses the
+    # existing TEST CONNECTION mechanism (an (ok, message) tuple rendered into
+    # the section's status QLabel) purely as a read-only report surface, so no
+    # new Qt widget was needed for this.
+    def _performance_settings_section(self) -> dict:
+        return {
+            "plugin":    "performance",
+            "namespace": "performance",
+            "title":     "📊 PERFORMANCE — per-turn latency & token telemetry",
+            "fields": [
+                {"key": "days", "type": "text", "label": "Window (days)", "default": "7"},
+            ],
+            "values": get_plugin_config("performance"),
+            "action": {"label": "REFRESH STATS", "run": self._refresh_performance_stats},
+        }
+
+    def _refresh_performance_stats(self, values: dict) -> tuple[bool, str]:
+        try:
+            days = max(1, int(float(values.get("days") or 7)))
+        except (TypeError, ValueError):
+            days = 7
+        try:
+            summary = telemetry.summary(days=days)
+        except Exception as e:
+            return False, f"Could not read telemetry: {e}"
+
+        lines = [f"Last {days}d:"]
+        if not summary["backends"]:
+            lines.append("No turns recorded yet.")
+        for name, s in sorted(summary["backends"].items()):
+            p50 = f"{s['p50_time_to_first_audio_ms']:.0f}ms" if s["p50_time_to_first_audio_ms"] is not None else "n/a"
+            p95 = f"{s['p95_time_to_first_audio_ms']:.0f}ms" if s["p95_time_to_first_audio_ms"] is not None else "n/a"
+            lines.append(
+                f"{name}: {s['turns']} turns · p50 {p50} · p95 {p95} · "
+                f"tok in/out {s['tokens_in']}/{s['tokens_out']} · "
+                f"fast-intent {s['fast_intent_hit_rate']*100:.0f}% · "
+                f"interrupted {s['interrupted_rate']*100:.0f}%"
+            )
+        if summary["tools"]:
+            top = sorted(summary["tools"].items(), key=lambda kv: -kv[1]["avg_ms"])[:5]
+            lines.append("Slowest tools: " + ", ".join(f"{n} {v['avg_ms']:.0f}ms" for n, v in top))
+        return True, "\n".join(lines)
 
     # ── Claude collaboration mode (core/claude_bridge.py) ─────────────────────
     # Same generic PluginSettingsOverlay rendering as ENGINE/TONE ADAPTATION
@@ -983,8 +1186,13 @@ class JarvisLive:
         return True
 
     async def _run_fast_intent(self, intent: "fast_intent.Intent") -> None:
+        turn = telemetry.start_turn("fast_intent")
+        turn.set_fast_intent()
         self.ui.set_state("THINKING")
-        result = await self._dispatch_tool(intent.tool, dict(intent.args))
+        with turn.tool_span(intent.tool):
+            result = await self._dispatch_tool(intent.tool, dict(intent.args))
+        turn.mark("model_done")   # no model call on this path — marks the shortcut's own latency
+        turn.finish()
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
@@ -1063,6 +1271,25 @@ class JarvisLive:
         self.set_speaking(False)
         if self._turn_done_event:
             self._turn_done_event.clear()
+
+        # Local Mode barge-in: tell the streaming consumer thread to stop
+        # reading from the LLM, drop any sentences already queued for TTS,
+        # and cut audio that's playing right now.
+        self._local_stream_cancel.set()
+        tts_q = self._local_tts_queue
+        if tts_q is not None:
+            while True:
+                try:
+                    tts_q.get_nowait()
+                except Exception:
+                    break
+            try:
+                tts_q.put_nowait(None)
+            except Exception:
+                pass
+        if self._local_tts_player is not None:
+            self._local_tts_player.stop()
+
         self.ui.write_log("SYS: Interrupted — listening...")
 
     def speak(self, text: str):
@@ -1424,6 +1651,17 @@ class JarvisLive:
 
         self._maybe_show_suggestion()
 
+        # Record-mode macros (core/sequence_memory.py): a no-op unless the
+        # user is actively recording one (start_recording/manage_sequence
+        # with action="record_start"). manage_sequence's own steps are
+        # excluded inside record_step itself, so a macro can't record itself.
+        # "confirm" is set from the sentinel core/confirm.py's request()
+        # returns — see manage_sequence's replay path re-gating on it.
+        if success:
+            sequence_memory.record_step(
+                name, args, confirm=isinstance(result, str) and result.startswith("[CONFIRMATION_PENDING]")
+            )
+
         return result
 
     def _log_context_turn(self, role: str, content: str) -> None:
@@ -1441,6 +1679,55 @@ class JarvisLive:
             except Exception as e:
                 print(f"[ContextManager] ⚠️ log_turn failed: {e}")
         asyncio.ensure_future(_do())
+
+    # ── Phone-dashboard parity: confirm / undo / suggestions ──────────────────
+    # Gives the phone the same three safety controls the HUD has, over the
+    # dashboard's existing /ws channel plus three POST endpoints — all routed
+    # through the exact functions the HUD's own buttons call
+    # (core.confirm.resolve, core.undo.undo_last, _on_suggestion_decision), so
+    # behaviour is identical no matter which surface acted, and a confirmation
+    # or suggestion resolved on one surface is invalid on the other because
+    # core.confirm/core.undo's pending state is a single shared slot/stack.
+
+    async def _broadcast_remote_state(self) -> None:
+        if not self._dashboard:
+            return
+        try:
+            await self._dashboard.broadcast({
+                "type":       "state",
+                "confirm":    confirm_gate.pending_info(),
+                "undo":       undo_stack.history(),
+                "suggestion": self._active_suggestion,
+            })
+        except Exception as e:
+            print(f"[Dashboard] state broadcast failed: {e}")
+
+    def _broadcast_remote_state_threadsafe(self) -> None:
+        """Safe to call from any thread (a Qt button handler, an executor
+        thread running a tool) — hops onto the asyncio loop to actually send."""
+        if self._loop:
+            asyncio.run_coroutine_threadsafe(self._broadcast_remote_state(), self._loop)
+
+    def _dashboard_confirm(self, confirm_id: str, accepted: bool) -> str | bool:
+        """Called off the dashboard's own event loop thread (see
+        dashboard/server.py's /api/confirm — it runs this in an executor).
+        Rejects a stale/already-resolved id instead of blindly resolving,
+        since core.confirm's pending slot is single-use across both surfaces."""
+        current = confirm_gate.pending_info()
+        if current is None or current["key"] != confirm_id:
+            return False
+        confirm_gate.resolve(accepted)
+        return True
+
+    def _dashboard_undo(self) -> str:
+        result = undo_stack.undo_last()
+        self._broadcast_remote_state_threadsafe()
+        return result
+
+    def _dashboard_suggestion(self, accepted: bool) -> None:
+        if self._active_suggestion is None:
+            return
+        self._on_suggestion_decision(accepted, self._active_suggestion)
 
     def _maybe_show_suggestion(self) -> None:
         """Throttled check for a proactive hint worth surfacing. Runs the
@@ -1473,15 +1760,16 @@ class JarvisLive:
             if top.pattern_key == self._last_suggested_pattern:
                 return  # already shown (and presumably dismissed/ignored) recently
             self._last_suggested_pattern = top.pattern_key
-            self.ui.show_suggestion(
-                {
-                    "action": top.action,
-                    "confidence_score": top.confidence_score,
-                    "reasoning": top.reasoning,
-                    "one_click_command": top.one_click_command,
-                    "pattern_key": top.pattern_key,
-                }
-            )
+            suggestion = {
+                "action": top.action,
+                "confidence_score": top.confidence_score,
+                "reasoning": top.reasoning,
+                "one_click_command": top.one_click_command,
+                "pattern_key": top.pattern_key,
+            }
+            self.ui.show_suggestion(suggestion)
+            self._active_suggestion = suggestion
+            await self._broadcast_remote_state()
 
         asyncio.ensure_future(_run())
 
@@ -1493,6 +1781,12 @@ class JarvisLive:
         identically to the user asking for it out loud."""
         pattern_key = suggestion.get("pattern_key", "")
         action      = suggestion.get("action", "")
+
+        if self._active_suggestion is suggestion or (
+            self._active_suggestion and self._active_suggestion.get("pattern_key") == pattern_key
+        ):
+            self._active_suggestion = None
+        self._broadcast_remote_state_threadsafe()
 
         async def _record():
             await asyncio.get_event_loop().run_in_executor(
@@ -1662,6 +1956,8 @@ class JarvisLive:
                         else:
                             if self._turn_done_event and self._turn_done_event.is_set():
                                 self._turn_done_event.clear()
+                            if self._current_turn:
+                                self._current_turn.mark_once("first_audio")
                             # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
                             # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
                             _audio_data = response.data
@@ -1680,6 +1976,8 @@ class JarvisLive:
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
+                                if not in_buf and self._current_turn is None:
+                                    self._current_turn = telemetry.start_turn("gemini")
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
 
@@ -1687,12 +1985,25 @@ class JarvisLive:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
 
+                            if self._current_turn:
+                                self._current_turn.mark("model_done")
+                                usage = getattr(response, "usage_metadata", None)
+                                if usage is not None:
+                                    self._current_turn.tokens(
+                                        tokens_in=getattr(usage, "prompt_token_count", None),
+                                        tokens_out=getattr(usage, "response_token_count", None),
+                                    )
+
                             # If this turn_complete ends an interrupted response, clear the
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
                                 self._interrupted = False
                                 in_buf  = []
                                 out_buf = []
+                                if self._current_turn:
+                                    self._current_turn.set_interrupted()
+                                    self._current_turn.finish()
+                                    self._current_turn = None
                                 continue
 
                             full_in = " ".join(in_buf).strip()
@@ -1720,6 +2031,10 @@ class JarvisLive:
                                         "ts": datetime.now().isoformat(),
                                     }))
                             out_buf = []
+
+                            if self._current_turn:
+                                self._current_turn.finish()
+                                self._current_turn = None
 
                             # Vision injection: model finished tool-response turn → now send the image
                             if self._pending_vision and self.session:
@@ -1756,7 +2071,10 @@ class JarvisLive:
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
+                            span = (self._current_turn.tool_span(fc.name)
+                                    if self._current_turn else contextlib.nullcontext())
+                            with span:
+                                fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
                             function_responses=fn_responses
@@ -2188,11 +2506,20 @@ class JarvisLive:
         # The confirmation gate is useless without a way to ask, and a memory
         # trim is invisible without a way to say so. Both are bound once here
         # rather than passed down through every action signature.
+        def _show_confirm_and_broadcast(title, detail):
+            self.ui.show_confirm(title, detail)
+            self._broadcast_remote_state_threadsafe()
+
+        def _hide_confirm_and_broadcast():
+            self.ui.hide_confirm()
+            self._broadcast_remote_state_threadsafe()
+
         confirm_gate.bind(
-            show = self.ui.show_confirm,
-            hide = self.ui.hide_confirm,
+            show = _show_confirm_and_broadcast,
+            hide = _hide_confirm_and_broadcast,
             log  = self.ui.write_log,
         )
+        undo_stack.bind(self._broadcast_remote_state_threadsafe)
         set_trim_notifier(self.ui.write_log)
 
         # Tell the device picker the exact rates the streams open at, from the
@@ -2209,6 +2536,9 @@ class JarvisLive:
             from dashboard.server import DashboardServer
             self._dashboard = DashboardServer()
             self._dashboard.set_connect_callback(self._on_phone_connected)
+            self._dashboard.set_confirm_callback(self._dashboard_confirm)
+            self._dashboard.set_undo_callback(self._dashboard_undo)
+            self._dashboard.set_suggestion_callback(self._dashboard_suggestion)
 
             async def _run_dashboard():
                 # asyncio.create_task() below only SCHEDULES this coroutine —
@@ -2529,7 +2859,64 @@ class JarvisLive:
         audio_i16 = np.concatenate(chunks).flatten()
         return audio_i16.astype(np.float32) / 32768.0
 
+    async def _stream_round(self, messages: list, tools: list, tts_queue: "queue.Queue") -> dict:
+        """Runs one streaming LLM turn in a background thread: forwards text
+        deltas through a SentenceChunker onto tts_queue as sentences complete,
+        and collects tool calls to return once the stream ends. Returns the
+        same {"content", "tool_calls"} shape llm_client.call_llm() does, so
+        the tool-calling loop in _run_local_loop doesn't need to know
+        streaming is happening underneath it."""
+        from core import llm_client
+        from core.sentence_chunker import SentenceChunker
+
+        self._local_stream_cancel.clear()
+
+        def _run() -> dict:
+            chunker = SentenceChunker()
+            full_content = ""
+            tool_calls: list = []
+            usage: dict = {}
+            for event in llm_client.stream_llm(messages, tools, cancel_event=self._local_stream_cancel):
+                if "delta" in event:
+                    full_content += event["delta"]
+                    for sentence in chunker.feed(event["delta"]):
+                        tts_queue.put(sentence)
+                elif "tool_call" in event:
+                    tool_calls.append(event["tool_call"])
+                elif "done" in event:
+                    usage = event["done"] or {}
+                    break
+            if not self._local_stream_cancel.is_set():
+                remainder = chunker.flush()
+                if remainder:
+                    tts_queue.put(remainder)
+            return {"content": full_content.strip(), "tool_calls": tool_calls, "usage": usage}
+
+        return await asyncio.to_thread(_run)
+
+    def _tts_consumer(self, tts_queue: "queue.Queue", tts_player, speech_profile, turn=None) -> None:
+        """Drains sentences _stream_round pushes and speaks them one at a
+        time, on its own thread for the whole turn — so speech overlaps with
+        the model still generating (and any tool dispatch in between rounds)
+        instead of waiting for the full reply. interrupt() stops this
+        mid-sentence by draining tts_queue, pushing the sentinel, and calling
+        tts_player.stop(). `turn` (core.telemetry.Turn), if given, is marked
+        "first_audio" right before the first sentence is actually spoken."""
+        first = True
+        while True:
+            item = tts_queue.get()
+            if item is None:
+                break
+            try:
+                if first and turn is not None:
+                    turn.mark_once("first_audio")
+                first = False
+                tts_player.speak(item, profile=speech_profile)
+            except Exception as e:
+                print(f"[Local] TTS error: {e}")
+
     async def _run_local_loop(self) -> None:
+        import queue
         from core import llm_client
         from core.tool_schema import gemini_tools_to_openai
         from core import tts as tts_mod
@@ -2580,8 +2967,7 @@ class JarvisLive:
             self.ui.write_log(f"ERR: Local text-to-speech failed to load: {e}")
             self.ui.set_state("SLEEPING")
             return
-
-        openai_tools = gemini_tools_to_openai(self._all_tool_declarations())
+        self._local_tts_player = tts_player
 
         if self._wake_enabled:
             self._ensure_wake_detector()
@@ -2673,10 +3059,27 @@ class JarvisLive:
 
             messages.append({"role": "user", "content": text})
 
+            turn = telemetry.start_turn("local")
+
+            tts_queue: "queue.Queue" = queue.Queue()
+            self._local_tts_queue = tts_queue
+            speaker = threading.Thread(
+                target=self._tts_consumer, args=(tts_queue, tts_player, speech_profile, turn), daemon=True,
+            )
+            speaker.start()
+            self.set_speaking(True)
+
             try:
-                resp = await asyncio.to_thread(llm_client.call_llm, messages, openai_tools)
+                resp = await self._stream_round(messages, gemini_tools_to_openai(self._all_tool_declarations()), tts_queue)
+                usage = resp.get("usage") or {}
+                turn.tokens(tokens_in=usage.get("prompt_tokens"), tokens_out=usage.get("completion_tokens"))
             except Exception as e:
                 self.ui.write_log(f"ERR: Local LLM call failed: {e}")
+                tts_queue.put(None)
+                await asyncio.to_thread(speaker.join)
+                self.set_speaking(False)
+                self._local_tts_queue = None
+                turn.finish()
                 continue
 
             # Tool-calling loop — capped so a model stuck calling tools can
@@ -2715,7 +3118,8 @@ class JarvisLive:
 
                     print(f"[JARVIS] 🔧 {name}  {args}")
                     self.ui.set_state("THINKING")
-                    tool_result = await self._dispatch_tool(name, args)
+                    with turn.tool_span(name):
+                        tool_result = await self._dispatch_tool(name, args)
                     print(f"[JARVIS] 📤 {name} → {str(tool_result)[:80]}")
                     messages.append({
                         "role": "tool", "tool_call_id": tc.get("id", ""),
@@ -2724,11 +3128,22 @@ class JarvisLive:
                 if standby_entered:
                     break
                 try:
-                    resp = await asyncio.to_thread(llm_client.call_llm, messages, openai_tools)
+                    resp = await self._stream_round(messages, gemini_tools_to_openai(self._all_tool_declarations()), tts_queue)
+                    usage = resp.get("usage") or {}
+                    turn.tokens(tokens_in=usage.get("prompt_tokens"), tokens_out=usage.get("completion_tokens"))
                 except Exception as e:
                     self.ui.write_log(f"ERR: Local LLM call failed: {e}")
                     resp = {"content": "", "tool_calls": []}
                     break
+
+            turn.mark("model_done")
+            if self._local_stream_cancel.is_set():
+                turn.set_interrupted()
+            tts_queue.put(None)
+            await asyncio.to_thread(speaker.join)
+            self.set_speaking(False)
+            self._local_tts_queue = None
+            turn.finish()
 
             if standby_entered:
                 continue
@@ -2739,14 +3154,6 @@ class JarvisLive:
                 self._session_log.append(f"{self._asst_name}: {reply}")
                 self._log_context_turn("assistant", reply)
                 messages.append({"role": "assistant", "content": reply})
-                self.set_speaking(True)
-                try:
-                    await asyncio.to_thread(
-                        lambda: tts_player.speak(reply, profile=speech_profile)
-                    )
-                except Exception as e:
-                    print(f"[Local] TTS error: {e}")
-                self.set_speaking(False)
 
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
